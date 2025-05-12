@@ -825,7 +825,9 @@ ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
       info("[replication] Data restore completed");
       post_fullsync_cb_();  // 正常完成后的清理
 
-      // 全同步完成后，重新加载命名空间（确保副本数据可见性）
+      // 重新加载命名空间
+      //  全同步时直接替换了底层 RocksDB 数据文件（SST），但内存中的 namespace 信息没更新。
+      //  `LoadAndRewrite` 会解析所有命名空间，重建内存中的元数据。
       s = srv_->GetNamespace()->LoadAndRewrite();
       if (!s.IsOK()) {
         error("[replication] Namespace reload failed: {}", s.Msg());
@@ -838,79 +840,115 @@ ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
   }
   unreachable();  // 理论上不可达（状态机完整性保护）
 }
-
+// 并行地从 master 拉取多个文件
+// 参数:
+//   dir: 存储文件的目标目录
+//   files: 需要拉取的文件列表，每个元素是 <文件名, CRC校验值> 对
 Status ReplicationThread::parallelFetchFile(const std::string &dir,
                                             const std::vector<std::pair<std::string, uint32_t>> &files) {
+  // 默认使用一个线程（串行），如果文件数超过 20，则使用 4 个线程并行拉取。
   size_t concurrency = 1;
   if (files.size() > 20) {
-    // Use 4 threads to download files in parallel
     concurrency = 4;
   }
+
+  // 原子计数器：记录已拉取和跳过的文件数
   std::atomic<uint32_t> fetch_cnt = {0};
   std::atomic<uint32_t> skip_cnt = {0};
+
+  // 存储异步操作结果的vector
   std::vector<std::future<Status>> results;
+
+  // 创建多个线程执行拉取任务
   for (size_t tid = 0; tid < concurrency; ++tid) {
     results.push_back(
         std::async(std::launch::async, [this, dir, &files, tid, concurrency, &fetch_cnt, &skip_cnt]() -> Status {
+          // 检查停止标志
           if (this->stop_flag_) {
             return {Status::NotOK, "replication thread was stopped"};
           }
+
+          // SSL相关初始化
           ssl_st *ssl = nullptr;
 #ifdef ENABLE_OPENSSL
+          // 如果启用了 TLS，创建 SSL 上下文
           if (this->srv_->GetConfig()->tls_replication) {
             ssl = SSL_new(this->srv_->ssl_ctx.get());
           }
+          // 使用 RAII 方式在退出时释放 SSL 资源
           auto exit = MakeScopeExit([ssl] { SSL_free(ssl); });
 #endif
-          int sock_fd = GET_OR_RET(util::SockConnect(this->host_, this->port_, ssl,
+
+          // 与 master 建立连接（可使用 SSL）
+          int sock_fd = GET_OR_RET(util::SockConnect(this->host_,
+                                                     this->port_,
+                                                     ssl,
                                                      this->srv_->GetConfig()->replication_connect_timeout_ms,
                                                      this->srv_->GetConfig()->replication_recv_timeout_ms)
                                        .Prefixed("connect the server err"));
+
 #ifdef ENABLE_OPENSSL
+          // 如果连接成功，不释放 SSL，后续仍需使用
           exit.Disable();
 #endif
-          UniqueFD unique_fd{sock_fd};
+
+          UniqueFD unique_fd{sock_fd};  // 使用RAII管理socket
+
+          // 发送认证信息
           auto s = this->sendAuth(sock_fd, ssl);
           if (!s.IsOK()) {
             return s.Prefixed("send the auth command err");
           }
-          std::vector<std::string> fetch_files;
-          std::vector<uint32_t> crcs;
+
+          // 准备需要拉取的文件列表
+          std::vector<std::string> fetch_files; // 文件名
+          std::vector<uint32_t> crcs;           // 校验值
+
+          // 分配任务给当前线程(按线程ID和并发数分配)
           for (auto f_idx = tid; f_idx < files.size(); f_idx += concurrency) {
             if (this->stop_flag_) {
               return {Status::NotOK, "replication thread was stopped"};
             }
+
             const auto &f_name = files[f_idx].first;
             const auto &f_crc = files[f_idx].second;
-            // Don't fetch existing files
+
+            // 检查文件是否已存在且 CRC 匹配
             if (engine::Storage::ReplDataManager::FileExists(this->storage_, dir, f_name, f_crc)) {
-              skip_cnt.fetch_add(1);
+              skip_cnt.fetch_add(1);  // 增加跳过计数
               uint32_t cur_skip_cnt = skip_cnt.load();
               uint32_t cur_fetch_cnt = fetch_cnt.load();
-              info("[skip] {} {}, skip count: {}, fetch count: {}, progress: {} / {}", f_name, f_crc, cur_skip_cnt,
-                   cur_fetch_cnt, (cur_skip_cnt + cur_fetch_cnt), files.size());
+              info("[skip] {} {}, skip count: {}, fetch count: {}, progress: {} / {}",
+                   f_name, f_crc, cur_skip_cnt, cur_fetch_cnt,
+                   (cur_skip_cnt + cur_fetch_cnt), files.size()); // 打印跳过信息
               continue;
             }
+
+            // 添加到待拉取列表
             fetch_files.push_back(f_name);
             crcs.push_back(f_crc);
           }
+
           unsigned files_count = files.size();
-          FetchFileCallback fn = [&fetch_cnt, &skip_cnt, files_count](const std::string &fetch_file,
-                                                                      uint32_t fetch_crc) {
-            fetch_cnt.fetch_add(1);
+          // 拉取完成后的回调函数
+          FetchFileCallback fn = [&fetch_cnt, &skip_cnt, files_count](const std::string &fetch_file, uint32_t fetch_crc) {
+            fetch_cnt.fetch_add(1);  // 增加拉取计数
             uint32_t cur_skip_cnt = skip_cnt.load();
             uint32_t cur_fetch_cnt = fetch_cnt.load();
-            info("[fetch] Fetched {}, crc32 {}, skip count: {}, fetch count: {}, progress: {} / {}", fetch_file,
-                 fetch_crc, cur_skip_cnt, cur_fetch_cnt, cur_skip_cnt + cur_fetch_cnt, files_count);
+            info("[fetch] Fetched {}, crc32 {}, skip count: {}, fetch count: {}, progress: {} / {}",
+                fetch_file, fetch_crc, cur_skip_cnt, cur_fetch_cnt,
+                cur_skip_cnt + cur_fetch_cnt, files_count); // 打印拉取信息
           };
-          // For master using old version, it only supports to fetch a single file by one
-          // command, so we need to fetch all files by multiple command interactions.
+
+          // 根据主节点版本选择拉取方式
           if (srv_->GetConfig()->master_use_repl_port) {
+            // 旧版本主节点：每次只能拉取单个文件，需多次请求。
             for (unsigned i = 0; i < fetch_files.size(); i++) {
               s = this->fetchFiles(sock_fd, dir, {fetch_files[i]}, {crcs[i]}, fn, ssl);
               if (!s.IsOK()) break;
             }
           } else {
+            // 新版本主节点：可以批量拉取文件
             if (!fetch_files.empty()) {
               s = this->fetchFiles(sock_fd, dir, fetch_files, crcs, fn, ssl);
             }
@@ -919,7 +957,7 @@ Status ReplicationThread::parallelFetchFile(const std::string &dir,
         }));
   }
 
-  // Wait til finish
+  // 等待所有线程结束，任何一个线程失败则直接返回错误。
   for (auto &f : results) {
     Status s = f.get();
     if (!s.IsOK()) return s;
@@ -950,8 +988,13 @@ Status ReplicationThread::sendAuth(int sock_fd, ssl_st *ssl) {
   return Status::OK();
 }
 
-Status ReplicationThread::fetchFile(int sock_fd, evbuffer *evbuf, const std::string &dir, const std::string &file,
-                                    uint32_t crc, const FetchFileCallback &fn, ssl_st *ssl) {
+Status ReplicationThread::fetchFile(int sock_fd,
+                                    evbuffer *evbuf,
+                                    const std::string &dir,
+                                    const std::string &file,
+                                    uint32_t crc,
+                                    const FetchFileCallback &fn,
+                                    ssl_st *ssl) {
   size_t file_size = 0;
 
   // Read file size line

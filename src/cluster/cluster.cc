@@ -929,8 +929,10 @@ bool Cluster::IsWriteForbiddenSlot(int slot) const {
   return srv_->slot_migrator->GetForbiddenSlotRange().Contains(slot);
 }
 
-Status Cluster::CanExecByMySelf(const redis::CommandAttributes *attributes, const std::vector<std::string> &cmd_tokens,
-                                redis::Connection *conn, lua::ScriptRunCtx *script_run_ctx) {
+Status Cluster::CanExecByMySelf(const redis::CommandAttributes *attributes,
+                                const std::vector<std::string> &cmd_tokens,
+                                redis::Connection *conn,
+                                lua::ScriptRunCtx *script_run_ctx) {
   std::vector<int> key_indexes;
 
   attributes->ForEachKeyRange(
@@ -1006,9 +1008,12 @@ Status Cluster::CanExecByMySelf(const redis::CommandAttributes *attributes, cons
     return Status::OK();  // I'm serving the imported slot
   }
 
-  if (myself_ && myself_->role == kClusterSlave && !(flags & redis::kCmdWrite) &&
-      nodes_.find(myself_->master_id) != nodes_.end() && nodes_[myself_->master_id] == slots_nodes_[slot] &&
-      conn->IsFlagEnabled(redis::Connection::kReadOnly)) {
+  if (myself_
+      && myself_->role == kClusterSlave
+      && !(flags & redis::kCmdWrite)
+      && nodes_.find(myself_->master_id) != nodes_.end()
+      && nodes_[myself_->master_id] == slots_nodes_[slot]
+      && conn->IsFlagEnabled(redis::Connection::kReadOnly)) {
     return Status::OK();  // My master is serving this slot
   }
 
