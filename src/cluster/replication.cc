@@ -556,50 +556,88 @@ ReplicationThread::CBState ReplicationThread::tryPSyncReadCB(bufferevent *bev) {
   }
 }
 
+/**
+ * 增量批次循环回调函数
+ *
+ * @param bev bufferevent对象，用于网络通信
+ * @return 返回状态机下一步状态
+ *
+ * 功能说明：
+ * 1. 处理主节点发送的增量更新数据
+ * 2. 按照Redis协议解析批量数据
+ * 3. 将解析后的写批次应用到本地存储
+ * 4. 处理主节点的心跳检测(ping)
+ *
+ * 协议格式：
+ * 1. 批量数据大小行: $<size>\r\n
+ * 2. 批量数据内容: <data>\r\n
+ *
+ * 状态转换：
+ * - Incr_batch_size: 读取批量数据大小
+ * - Incr_batch_data: 读取批量数据内容
+ */
 ReplicationThread::CBState ReplicationThread::incrementBatchLoopCB(bufferevent *bev) {
+  // 设置复制状态为 "已连接"，表示增量复制阶段已经开始
   repl_state_.store(kReplConnected, std::memory_order_relaxed);
+
+  // 获取输入缓冲区，读取主节点发送的写入数据
   auto input = bufferevent_get_input(bev);
+
+  // 主循环，持续处理从主节点接收的增量写入数据
   while (true) {
     switch (incr_state_) {
+      // 读取 `批量数据大小`
       case Incr_batch_size: {
-        // Read bulk length
+        // 从缓冲区中读取一行，格式为 "$<size>\r\n"，表示接下来数据的长度（RESP 协议中的 Bulk String）
         UniqueEvbufReadln line(input, EVBUFFER_EOL_CRLF_STRICT);
-        if (!line) return CBState::AGAIN;
+        if (!line) return CBState::AGAIN; // 数据不足，直接返回，等待下次回调来获取更多数据
+        // 解析批量数据大小($<size>中的size, 需要跳过 '$' 开头) ，单位为字节数
         incr_bulk_len_ = line.length > 0 ? std::strtoull(line.get() + 1, nullptr, 10) : 0;
+        // 验证数据大小有效性
         if (incr_bulk_len_ == 0) {
           error("[replication] Invalid increment data size");
-          return CBState::RESTART;
+          return CBState::RESTART;   // 无效数据，重启状态机
         }
+        // 读取 `批量数据大小` 成功，进入读取 `批量数据内容` 阶段
         incr_state_ = Incr_batch_data;
         break;
       }
+      // 读取 `批量数据内容`
       case Incr_batch_data:
-        // Read bulk data (batch data)
-        if (incr_bulk_len_ + 2 > evbuffer_get_length(input)) {  // If data not enough
-          return CBState::AGAIN;
+        // 判断输入缓冲区是否包含足够的数据（incr_bulk_len_ + "\r\n"）
+        if (incr_bulk_len_ + 2 > evbuffer_get_length(input)) {
+          return CBState::AGAIN;  // 数据不足，直接返回，等待下次回调来获取更多数据
         }
-
+        // 获取批量数据指针(避免拷贝)，数据中包括后续的 \r\n
         const char *bulk_data =
             reinterpret_cast<const char *>(evbuffer_pullup(input, static_cast<ssize_t>(incr_bulk_len_ + 2)));
+
+        // 创建 bulk_string ，存储 bulk_data 前 bulk_len_ 字节，不含 \r\n
         std::string bulk_string = std::string(bulk_data, incr_bulk_len_);
+
+        // 从缓冲区移除已处理数据
         evbuffer_drain(input, incr_bulk_len_ + 2);
+
+        // 重置状态为读取下一个批量数据大小
         incr_state_ = Incr_batch_size;
 
+        // 特殊处理 ping 包：主节点定期发送 "ping"，作为心跳检测，不应写入数据库
         if (bulk_string == "ping") {
-          // master would send the ping heartbeat packet to check whether the slave was alive or not,
-          // don't write ping to db here.
-          return CBState::AGAIN;
+          return CBState::AGAIN;  // 不处理 ping，仅保持连接活跃
         }
 
+        // 基于 bulk_string 构造 RocksDB 的 WriteBatch
         rocksdb::WriteBatch batch(std::move(bulk_string));
 
+        // 把 WriteBatch 应用到本地存储
         auto s = storage_->ReplicaApplyWriteBatch(&batch);
         if (!s.IsOK()) {
           error("[replication] CRITICAL - Failed to write batch to local, {}. batch: 0x{}", s.Msg(),
                 util::StringToHex(batch.Data()));
-          return CBState::RESTART;
+          return CBState::RESTART;  // 写入失败，重启状态机
         }
 
+        // 解析 WriteBatch，用于统计或进一步处理（如 Stream、PubSub）
         s = parseWriteBatch(batch);
         if (!s.IsOK()) {
           error("[replication] CRITICAL - failed to parse write batch 0x{}: {}", util::StringToHex(batch.Data()),
@@ -619,29 +657,64 @@ ReplicationThread::CBState ReplicationThread::fullSyncWriteCB(bufferevent *bev) 
   return CBState::NEXT;
 }
 
+/**
+ * 当从节点进入 fullsync 状态时，它将读取来自主节点发送的 元信息（meta）及 SST 文件清单，并随后开始并行下载数据文件，并恢复到本地 DB 。
+ *
+ * @param bev Libevent 缓冲事件对象，用于网络 IO
+ * @return 状态机下一步动作 (AGAIN/RESTART/QUIT)
+ */
+
+
+// Q: 为啥需要清理检查点中的无效文件，检查点中都包含啥文件？
+// A:
+//  检查点（checkpoint） 包含数据库在某一时刻的完整快照文件，这些文件用于全量同步（full sync）时从主节点（master）复制到从节点（slave）。
+//
+//  检查点中的文件通常包括：
+//  - SST 文件（.sst）: RocksDB 的实际数据文件，存储键值对数据。
+//  - MANIFEST 文件: 记录 RocksDB 的版本变更信息，用于恢复数据库状态。
+//  - CURRENT 文件: 指向当前有效的 MANIFEST 文件。
+//  - OPTIONS 文件: 存储数据库配置选项。
+//  - 其他可能的元数据文件: 如 IDENTITY、LOG 等。
+//
+//  为什么需要清理无效文件？
+//  在复制过程中，从节点需要确保检查点目录中只包含主节点发送的有效文件，避免以下问题：
+//  - 避免残留旧数据污染新同步
+//    如果前一次同步失败，可能残留部分文件，如果不清理，可能导致数据不一致。
+//    例如，旧 .sst 文件可能包含已删除的数据，影响新同步的正确性。
+//  - CURRENT 文件必须清理
+//    CURRENT 文件不包含文件编号（而其他文件如 MANIFEST-000123 有编号），无法通过文件名判断其是否属于当前有效数据。
+//    如果不清理，可能导致从节点加载错误的 MANIFEST，进而恢复错误的数据库状态。
+//  - 节省磁盘空间
+//    无效文件占用磁盘空间，尤其是大容量数据库，清理可以避免浪费。
 ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
-  auto input = bufferevent_get_input(bev);
+  auto input = bufferevent_get_input(bev);  // 获取输入缓冲区
   switch (fullsync_state_) {
+    // 阶段1：获取主节点发来的 meta ID（RocksDB备份ID），新版本 kvrocks 没有此阶段
     case kFetchMetaID: {
-      // New version master only sends meta file content
+      // 如果主节点是新版本（不使用 repl port），则跳过 meta_id 阶段
       if (!srv_->GetConfig()->master_use_repl_port) {
         fullsync_state_ = kFetchMetaContent;
         return CBState::AGAIN;
       }
+      // 读取一行数据，从中解析出 backup ID
       UniqueEvbufReadln line(input, EVBUFFER_EOL_CRLF_STRICT);
-      if (!line) return CBState::AGAIN;
-      if (line[0] == '-') {
+      if (!line) return CBState::AGAIN;  // 数据不足，等待下次回调
+      if (line[0] == '-') { // 错误处理（主节点返回"-"开头表示错误）
         error("[replication] Failed to fetch meta id: {}", line.get());
-        return CBState::RESTART;
+        return CBState::RESTART;  // 需要重启同步流程
       }
+      // 解析备份ID（RocksDB的BackupID）
       fullsync_meta_id_ = static_cast<rocksdb::BackupID>(line.length > 0 ? std::strtoul(line.get(), nullptr, 10) : 0);
-      if (fullsync_meta_id_ == 0) {
+      if (fullsync_meta_id_ == 0) {  // 校验有效性
         error("[replication] Invalid meta id received");
         return CBState::RESTART;
       }
-      fullsync_state_ = kFetchMetaSize;
+      fullsync_state_ = kFetchMetaSize;  // 转移到下一状态
       info("[replication] Succeed fetching meta id: {}", fullsync_meta_id_);
+      // 注意：此处故意省略break，实现自动状态流转
     }
+
+    // 阶段2：获取主节点发来的 meta 文件大小
     case kFetchMetaSize: {
       UniqueEvbufReadln line(input, EVBUFFER_EOL_CRLF_STRICT);
       if (!line) return CBState::AGAIN;
@@ -649,110 +722,121 @@ ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
         error("[replication] Failed to fetch meta size: {}", line.get());
         return CBState::RESTART;
       }
+
       fullsync_filesize_ = line.length > 0 ? std::strtoull(line.get(), nullptr, 10) : 0;
-      if (fullsync_filesize_ == 0) {
+      if (fullsync_filesize_ == 0) {  // 校验文件大小有效性
         error("[replication] Invalid meta file size received");
         return CBState::RESTART;
       }
-      fullsync_state_ = kFetchMetaContent;
+
+      fullsync_state_ = kFetchMetaContent;  // 状态转移
       info("[replication] Succeed fetching meta size: {}", fullsync_filesize_);
+      // 注意：此处故意省略break，实现自动状态流转
     }
+
+    // 阶段3：获取元数据内容（核心阶段）
     case kFetchMetaContent: {
       std::string target_dir;
       engine::Storage::ReplDataManager::MetaInfo meta;
-      // Master using old version
+
+      // 处理旧版本 master 的情况（通过备份端口）
       if (srv_->GetConfig()->master_use_repl_port) {
+        // 检查是否接收完完整的元数据文件
         if (evbuffer_get_length(input) < fullsync_filesize_) {
           return CBState::AGAIN;
         }
+        // 解析并保存元数据（包含SST文件列表等信息）
         auto s = engine::Storage::ReplDataManager::ParseMetaAndSave(storage_, fullsync_meta_id_, input, &meta);
         if (!s.IsOK()) {
           error("[replication] Failed to parse meta and save: {}", s.Msg());
           return CBState::AGAIN;
         }
-        target_dir = srv_->GetConfig()->backup_sync_dir;
-      } else {
-        // Master using new version
+        target_dir = srv_->GetConfig()->backup_sync_dir;  // 备份目录
+      }
+      // 处理新版本 master 的情况（通过常规复制端口）
+      else {
+        // 读取一行数据
         UniqueEvbufReadln line(input, EVBUFFER_EOL_CRLF_STRICT);
         if (!line) return CBState::AGAIN;
         if (line[0] == '-') {
           error("[replication] Failed to fetch meta info: {}", line.get());
           return CBState::RESTART;
         }
+
+        // 解析出需要同步的文件列表（逗号分隔）
         std::vector<std::string> need_files = util::Split(std::string(line.get()), ",");
         for (const auto &f : need_files) {
-          meta.files.emplace_back(f, 0);
+          meta.files.emplace_back(f, 0);  // 文件名+文件大小（0 表示未指定）
         }
 
-        target_dir = srv_->GetConfig()->sync_checkpoint_dir;
-        // Clean invalid files of checkpoint, "CURRENT" file must be invalid
-        // because we identify one file by its file number but only "CURRENT"
-        // file doesn't have number.
+        // 清理检查点目录中的无效文件，"CURRENT"文件必须被清理(因为 CURRENT 是软链接，必须重新生成)
+        target_dir = srv_->GetConfig()->sync_checkpoint_dir;  // 检查点目录
         auto iter = std::find(need_files.begin(), need_files.end(), "CURRENT");
         if (iter != need_files.end()) need_files.erase(iter);
+        // 清理不在 need_files 列表中的文件
         auto s = engine::Storage::ReplDataManager::CleanInvalidFiles(storage_, target_dir, need_files);
+
+        // 清理失败时的降级处理：暴力删除整个目录，确保没有残留数据影响同步。
         if (!s.IsOK()) {
-          warn("[replication] Failed to clean up invalid files of the old checkpoint, error: {}", s.Msg());
-          warn("[replication] Try to clean all checkpoint files");
+          warn("[replication] Failed to clean invalid files, attempting full cleanup");
           auto s = rocksdb::DestroyDB(target_dir, rocksdb::Options());
           if (!s.ok()) {
-            warn("[replication] Failed to clean all checkpoint files, error: {}", s.ToString());
+            warn("[replication] Full cleanup failed: {}", s.ToString());
           }
         }
       }
-      assert(evbuffer_get_length(input) == 0);
-      fullsync_state_ = kFetchMetaID;
-      info("[replication] Succeeded fetching full data files info, fetching files in parallel");
 
+      assert(evbuffer_get_length(input) == 0);  // 确保缓冲区已完全消费
+      fullsync_state_ = kFetchMetaID;  // 重置状态机
+      info("[replication] Files info received, starting parallel download");
+
+      // 如果配置要求全同步前清空本地数据库
       bool pre_fullsync_done = false;
-      // If 'slave-empty-db-before-fullsync' is yes, we call 'pre_fullsync_cb_'
-      // just like reloading database. And we don't want slave to occupy too much
-      // disk space, so we just empty entire database rudely.
       if (srv_->GetConfig()->slave_empty_db_before_fullsync) {
-        if (!pre_fullsync_cb_()) return CBState::RESTART;
+        if (!pre_fullsync_cb_()) return CBState::RESTART;  // 回调预处理
         pre_fullsync_done = true;
-        storage_->EmptyDB();
+        storage_->EmptyDB();  // 清空数据库
       }
 
+      // 并行下载 SST 文件（多线程加速）
       repl_state_.store(kReplFetchSST, std::memory_order_relaxed);
       auto s = parallelFetchFile(target_dir, meta.files);
       if (!s.IsOK()) {
-        if (pre_fullsync_done) post_fullsync_cb_();
-        error("[replication] Failed to parallel fetch files while {}", s.Msg());
+        if (pre_fullsync_done) post_fullsync_cb_();  // 回滚预处理
+        error("[replication] Parallel fetch failed: {}", s.Msg());
         return CBState::RESTART;
       }
-      info("[replication] Succeeded fetching files in parallel, restoring the backup");
+      info("[replication] Files download completed, restoring data");
 
-      // Don't need to call 'pre_fullsync_cb_' again if it was called before
+      // 执行预处理回调（如果之前未执行）
       if (!pre_fullsync_done && !pre_fullsync_cb_()) return CBState::RESTART;
 
-      // For old version, master uses rocksdb backup to implement data snapshot
+      // 数据恢复：根据 master 版本选择不同的恢复方式，旧版本用 BackupEngine ，新版本用 Checkpoint
       if (srv_->GetConfig()->master_use_repl_port) {
-        s = storage_->RestoreFromBackup();
+        s = storage_->RestoreFromBackup();    // 从备份恢复(旧版本)
       } else {
-        s = storage_->RestoreFromCheckpoint();
+        s = storage_->RestoreFromCheckpoint(); // 从检查点恢复(新版本)
       }
       if (!s.IsOK()) {
-        error("[replication] Failed to restore backup while {}, restart fullsync", s.Msg());
-        post_fullsync_cb_();
+        error("[replication] Restore failed: {}, restarting", s.Msg());
+        post_fullsync_cb_();  // 清理资源
         return CBState::RESTART;
       }
-      info("[replication] Succeeded restoring the backup, fullsync was finish");
-      post_fullsync_cb_();
+      info("[replication] Data restore completed");
+      post_fullsync_cb_();  // 正常完成后的清理
 
-      // It needs to reload namespaces from DB after the full sync is done,
-      // or namespaces are not visible in the replica.
+      // 全同步完成后，重新加载命名空间（确保副本数据可见性）
       s = srv_->GetNamespace()->LoadAndRewrite();
       if (!s.IsOK()) {
-        error("[replication] Failed to load and rewrite namespace: {}", s.Msg());
+        error("[replication] Namespace reload failed: {}", s.Msg());
       }
 
-      // Switch to psync state machine again
+      // 切换回增量同步状态机
       psync_steps_.Start();
-      return CBState::QUIT;
+      return CBState::QUIT;  // 全量同步完成
     }
   }
-  unreachable();
+  unreachable();  // 理论上不可达（状态机完整性保护）
 }
 
 Status ReplicationThread::parallelFetchFile(const std::string &dir,
@@ -980,46 +1064,89 @@ void ReplicationThread::TimerCB(int, int16_t) {
   }
 }
 
+
+/**
+ * 解析主节点发送来的 WriteBatch 数据，并处理其中的特殊逻辑，比如：
+ *  - 发布 Pub/Sub 消息；
+ *  - 处理脚本传播；
+ *  - 处理 Stream 消息追加事件；
+ *  - 加载命名空间配置。
+ *
+ * @param write_batch RocksDB WriteBatch 对象，包含需要解析的操作数据
+ * @return 返回执行状态，成功返回OK，失败返回错误信息
+ *
+ * 功能说明：
+ * 1. 使用 WriteBatchHandler 迭代解析写批次中的操作
+ * 2. 根据操作类型(kBatchTypePublish/kBatchTypePropagate/kBatchTypeStream)执行相应处理
+ * 3. 处理发布订阅消息、传播命令和流数据等特殊操作
+ *
+ * 处理逻辑：
+ * - 发布订阅消息: 通过 PublishMessage 广播消息
+ * - 传播命令: 执行传播的命令或加载命名空间
+ * - 流数据: 触发流条目添加事件
+ * - 其他类型: 不做特殊处理
+ */
 Status ReplicationThread::parseWriteBatch(const rocksdb::WriteBatch &write_batch) {
+  // 1. 创建自定义的 WriteBatchHandler，用于处理 WriteBatch 中的数据操作
   WriteBatchHandler write_batch_handler;
-
+  // 2. 迭代处理 WriteBatch 中的数据操作
   auto db_status = write_batch.Iterate(&write_batch_handler);
-  if (!db_status.ok()) return {Status::NotOK, "failed to iterate over write batch: " + db_status.ToString()};
+  if (!db_status.ok())
+    return {Status::NotOK, "failed to iterate over write batch: " + db_status.ToString()};
 
+  // 3. 根据 WriteBatch 的类型执行相应处理
   switch (write_batch_handler.Type()) {
+    // 3.1 发布订阅处理：
+    //  - 当操作类型为 kBatchTypePublish 时，调用 PublishMessage 进行消息广播
+    //  - 实现跨节点的发布订阅功能
     case kBatchTypePublish:
+      // 主节点执行过 PUBLISH 命令，从节点收到后也触发本地发布，将 kv 发布消息到指定频道
       srv_->PublishMessage(write_batch_handler.Key(), write_batch_handler.Value());
       break;
+    // 3.2 命令传播处理：
+    //  - 处理传播的 Lua 脚本命令(engine::kPropagateScriptCommand)
+    //  - 处理命名空间配置的动态加载(kNamespaceDBKey)
     case kBatchTypePropagate:
-      if (write_batch_handler.Key() == engine::kPropagateScriptCommand) {
+      if (write_batch_handler.Key() == engine::kPropagateScriptCommand) {    // Lua 脚本
+        // 将 value 解析为 Redis 协议格式，再次执行
         std::vector<std::string> tokens = util::TokenizeRedisProtocol(write_batch_handler.Value());
         if (!tokens.empty()) {
-          auto s = srv_->ExecPropagatedCommand(tokens);
+          auto s = srv_->ExecPropagatedCommand(tokens);  // 执行实际命令
           if (!s.IsOK()) {
             return s.Prefixed("failed to execute propagate command");
           }
         }
-      } else if (write_batch_handler.Key() == kNamespaceDBKey) {
+      } else if (write_batch_handler.Key() == kNamespaceDBKey) { // namespace 配置命令（用于加载/同步命名空间信息）
+        // 重新加载 namespace 信息
         auto s = srv_->GetNamespace()->LoadAndRewrite();
         if (!s.IsOK()) {
           return s.Prefixed("failed to load namespaces");
         }
       }
       break;
+    // 3.3 流数据处理
+    //  - 解析流条目键(包含命名空间和键名)
+    //  - 从子键中提取流条目ID(时间戳+序列号)
+    //  - 触发流条目添加事件通知
     case kBatchTypeStream: {
+      // 从 batch 中获取当前写入的 key ，并解析内部 key（包含 slot、ns、key 等）
       auto key = write_batch_handler.Key();
       InternalKey ikey(key, storage_->IsSlotIdEncoded());
+      // 提取 entry_id（包含时间戳+序列号）
       Slice entry_id = ikey.GetSubKey();
       redis::StreamEntryID id;
-      GetFixed64(&entry_id, &id.ms);
-      GetFixed64(&entry_id, &id.seq);
+      GetFixed64(&entry_id, &id.ms);  // 解析时间戳，毫秒
+      GetFixed64(&entry_id, &id.seq); // 解析序列号，同一毫秒内的序号
+      // 调用 stream 数据追加的回调（通知监听器、触发事件）
       srv_->OnEntryAddedToStream(ikey.GetNamespace().ToString(), ikey.GetKey().ToString(), id);
       break;
     }
+    // 3.4 无需特殊处理
     case kBatchTypeNone:
       break;
   }
-  return Status::OK();
+
+  return Status::OK();  // 所有处理成功，返回 OK
 }
 
 bool ReplicationThread::isRestoringError(std::string_view err) {
@@ -1037,21 +1164,37 @@ bool ReplicationThread::isUnknownOption(std::string_view err) {
   return err == RESP_PREFIX_ERROR + redis::StatusToRedisErrorMsg({Status::NotOK, redis::errUnknownOption});
 }
 
-rocksdb::Status WriteBatchHandler::PutCF(uint32_t column_family_id, const rocksdb::Slice &key,
-                                         const rocksdb::Slice &value) {
+// PutCF 解析 rocksdb 写入操作属于哪种语义类型，并将 key/value 缓存在 handler 内部字段中（kv_）以备后续 parseWriteBatch 使用
+//
+// 在 Kvrocks 中，为了实现 Redis 语义，设计了多个逻辑上的列族（Column Family），如：
+//
+// 列族名	枚举值	                        功能说明
+// PubSub	ColumnFamilyID::PubSub	        存放主节点发布的 Pub/Sub 消息
+// Propagate	ColumnFamilyID::Propagate	存放需要传播的命令（如脚本、namespace）
+// Stream	ColumnFamilyID::Stream	        存放 Stream 的实际追加数据
+//
+// 通过这样的设计，主节点在执行命令时会把需要同步给从节点的副作用数据写入对应列族中，从节点在解析写批时就能知道它是何种语义，进而触发适当的行为。
+rocksdb::Status WriteBatchHandler::PutCF(uint32_t column_family_id, const rocksdb::Slice &key, const rocksdb::Slice &value) {
+  // 默认认为是普通写操作（无副作用）
   type_ = kBatchTypeNone;
+
+  // 判断是否是 PubSub 消息列族
   if (column_family_id == static_cast<uint32_t>(ColumnFamilyID::PubSub)) {
-    type_ = kBatchTypePublish;
-    kv_ = std::make_pair(key.ToString(), value.ToString());
+    type_ = kBatchTypePublish;  // 标记为 PUBLISH 类型
+    kv_ = std::make_pair(key.ToString(), value.ToString());  // 记录 key/value
     return rocksdb::Status::OK();
+  // 判断是否是 Propagate（命令传播）列族
   } else if (column_family_id == static_cast<uint32_t>(ColumnFamilyID::Propagate)) {
-    type_ = kBatchTypePropagate;
+    type_ = kBatchTypePropagate;  // 标记为传播命令
     kv_ = std::make_pair(key.ToString(), value.ToString());
     return rocksdb::Status::OK();
+  // 判断是否是 Stream 列族（用于处理 Stream 数据追加）
   } else if (column_family_id == static_cast<uint32_t>(ColumnFamilyID::Stream)) {
-    type_ = kBatchTypeStream;
+    type_ = kBatchTypeStream;  // 标记为 Stream 类型
     kv_ = std::make_pair(key.ToString(), value.ToString());
     return rocksdb::Status::OK();
   }
+  // 其他列族：默认不需要特殊处理，仅作为普通写入存在
   return rocksdb::Status::OK();
 }
+

@@ -162,16 +162,16 @@ class ReplicationThread : private EventCallbackBase<ReplicationThread> {
 
  private:
   // 成员变量
-  std::thread t_;  // 工作线程
-  std::atomic<bool> stop_flag_ = false;  // 停止标志
-  std::string host_;  // 主节点主机
-  uint32_t port_;     // 主节点端口
-  Server *srv_ = nullptr;  // Server实例
-  engine::Storage *storage_ = nullptr;  // 存储引擎
-  std::atomic<ReplState> repl_state_;  // 复制状态
-  std::atomic<int64_t> last_io_time_secs_ = 0;  // 最后IO时间
-  bool next_try_old_psync_ = false;  // 是否尝试旧版PSYNC
-  bool next_try_without_announce_ip_address_ = false;  // 是否不宣布IP地址
+  std::thread t_;                                     // 工作线程
+  std::atomic<bool> stop_flag_ = false;               // 停止标志
+  std::string host_;                                  // 主节点主机
+  uint32_t port_;                                     // 主节点端口
+  Server *srv_ = nullptr;                             // Server实例
+  engine::Storage *storage_ = nullptr;                // 存储引擎
+  std::atomic<ReplState> repl_state_;                 // 复制状态
+  std::atomic<int64_t> last_io_time_secs_ = 0;        // 最后IO时间
+  bool next_try_old_psync_ = false;                   // 是否尝试旧版PSYNC
+  bool next_try_without_announce_ip_address_ = false; // 是否不宣布IP地址
 
   // 回调函数
   std::function<bool()> pre_fullsync_cb_;  // 全量同步前回调
@@ -184,8 +184,8 @@ class ReplicationThread : private EventCallbackBase<ReplicationThread> {
     kFetchMetaSize,    // 获取元数据大小
     kFetchMetaContent, // 获取元数据内容
   } fullsync_state_ = kFetchMetaID;
-  rocksdb::BackupID fullsync_meta_id_ = 0;  // 元数据ID
-  size_t fullsync_filesize_ = 0;            // 文件大小
+  rocksdb::BackupID fullsync_meta_id_ = 0;  // 元数据 ID ，RocksDB的BackupID
+  size_t fullsync_filesize_ = 0;            // 元数据文件大小 ，
 
   // Internal states managed by IncrementBatchLoop procedure
   // 增量同步状态
