@@ -41,27 +41,29 @@ class ClusterNode {
  public:
   explicit ClusterNode(std::string id, std::string host, int port, int role, std::string master_id,
                        const std::bitset<kClusterSlots> &slots);
-  std::string id;
-  std::string host;
-  int port;
-  int role;
-  std::string master_id;
-  std::bitset<kClusterSlots> slots;
-  std::vector<std::string> replicas;
-  SlotRange importing_slot_range = {-1, -1};
+  std::string id;                      // 节点 ID ，40 字符
+  std::string host;                    // 节点 IP
+  int port;                            // 节点 PORT
+  int role;                            // 角色(kClusterMaster/kClusterSlave)
+  std::string master_id;               // 主节点ID(如果是副本)
+  std::bitset<kClusterSlots> slots;    // 当前节点负责的槽位位图
+  std::vector<std::string> replicas;   // 副本节点ID列表
+  SlotRange importing_slot_range = {-1, -1};  // 正在导入的槽位范围
 };
 
 struct SlotInfo {
-  int start;
-  int end;
+  int start;          // 起始槽位
+  int end;            // 结束槽位
   struct NodeInfo {
-    std::string host;
-    int port;
-    std::string id;
+    std::string host; // 节点地址
+    int port;         // 节点端口
+    std::string id;   // 节点ID
   };
-  std::vector<NodeInfo> nodes;
+  std::vector<NodeInfo> nodes; // 负责该槽位的节点列表
 };
 
+
+// 节点ID -> ClusterNode 结构
 using ClusterNodes = std::unordered_map<std::string, std::shared_ptr<ClusterNode>>;
 
 class Server;
@@ -108,12 +110,12 @@ class Cluster {
   std::vector<std::string> binds_;
   int port_;
   int size_ = 0;
-  int64_t version_ = -1;
-  std::string myid_;
-  std::shared_ptr<ClusterNode> myself_;
-  ClusterNodes nodes_;
-  std::shared_ptr<ClusterNode> slots_nodes_[kClusterSlots];
+  int64_t version_ = -1;                                    // 集群配置版本号
+  std::string myid_;                                        // 当前节点 ID
+  std::shared_ptr<ClusterNode> myself_;                     // 当前节点结构
+  ClusterNodes nodes_;                                      // 集群所有节点: node_id => node
+  std::shared_ptr<ClusterNode> slots_nodes_[kClusterSlots]; // slot => node
 
-  std::map<int, std::string> migrated_slots_;
-  std::set<int> imported_slots_;
+  std::map<int, std::string> migrated_slots_; // 已迁移槽位
+  std::set<int> imported_slots_;              // 已导入槽位
 };

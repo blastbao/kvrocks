@@ -25,6 +25,33 @@
 
 #include "status.h"
 
+// BatchSender 的作用是在迁移数据时把多条写操作（Put/Delete/LogData）批量打包成一个 RocksDB 的 WriteBatch，然后发送给目标实例，并支持速率限制。
+//
+// 成员变量
+//    | 变量名                                                | 说明                                                  |
+//    | ---------------------- ------------------------------| ---------------------------------------------------- |
+//    | `dst_fd_`                                            | 目标 socket 文件描述符（目标实例的连接）                   |
+//    | `write_batch_`                                       | 当前正在累积的 RocksDB `WriteBatch` 对象                |
+//    | `max_bytes_`                                         | 每个批次最大字节数，超出则需要发送                         |
+//    | `bytes_per_sec_`                                     | 限速值，单位 B/s（0 表示不限制）                          |
+//    | `rate_limiter_`                                      | 限速器，使用 RocksDB 提供的 `GenericRateLimiter`        |
+//    | `prefix_logdata_`                                    | 额外的 log 数据（如迁移的元信息），用于写 batch 前预设      |
+//    | `sent_bytes_` / `sent_batches_num_` / `entries_num_` | 已发送的统计信息                                        |
+//    | `pending_entries_`                                   | 当前未发送的 entry 数量（调用了 Put/Delete 但还没 Send）   |
+//    | ---------------------- ------------------------------| ---------------------------------------------------- |
+//
+// 设计特点
+//  - 批量处理：积累多个操作后一次性发送，提高效率
+//  - 速率控制：通过令牌桶算法限制发送速率
+//  - 日志支持：支持在数据前添加日志信息
+//  - 错误处理：每个操作都有状态返回
+//  - 统计功能：跟踪发送量、批次数量等指标
+//
+// 典型使用场景
+//  这个类主要用于数据迁移场景，将RocksDB的变更批量发送到另一个节点，常见于：
+//  - 数据库复制
+//  - 数据备份
+//  - 集群扩容时的数据迁移
 class BatchSender {
  public:
   BatchSender() = default;
@@ -69,3 +96,6 @@ class BatchSender {
   size_t bytes_per_sec_ = 0;  // 0 means no limit
   std::unique_ptr<rocksdb::RateLimiter> rate_limiter_;
 };
+
+
+

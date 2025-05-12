@@ -147,46 +147,75 @@ Status Cluster::SetSlotRanges(const std::vector<SlotRange> &slot_ranges, const s
 
 // cluster setnodes $all_nodes_info $version $force
 // one line of $all_nodes: $node_id $host $port $role $master_node_id $slot_range
+/**
+ * 设置集群节点配置信息
+ *
+ * @param nodes_str 集群节点信息字符串，格式为多行文本，每行描述一个节点
+ * @param version 集群配置版本号，必须大于当前版本(除非force=true)
+ * @param force 是否强制更新，即使版本号不递增
+ *
+ * @return 执行状态，成功返回OK，失败返回错误信息
+ *
+ * 功能说明：
+ * 1. 解析并验证节点信息字符串
+ * 2. 更新集群拓扑结构和版本号
+ * 3. 建立主从复制关系
+ * 4. 清理迁移/导入槽位相关数据
+ *
+ * 节点信息字符串格式示例：
+ * <node_id> <host:port> <role> <master_id> <slots>
+ *
+ * 注意事项：
+ * 1. 版本号必须递增(除非force=true)
+ * 2. 会自动识别当前节点ID(匹配IP和端口)
+ * 3. 会清除已迁移槽位的数据
+ */
 Status Cluster::SetClusterNodes(const std::string &nodes_str, int64_t version, bool force) {
+  // 版本号检查
   if (version < 0) return {Status::NotOK, errInvalidClusterVersion};
 
   if (!force) {
-    // Low version wants to reset current version
+    // 非强制模式下，版本号必须递增
     if (version_ > version) {
       return {Status::NotOK, errInvalidClusterVersion};
     }
 
-    // The same version, it is not needed to update
+    // 相同版本无需更新
     if (version_ == version) return Status::OK();
   }
 
-  ClusterNodes nodes;
-  std::unordered_map<int, std::string> slots_nodes;
-  Status s = parseClusterNodes(nodes_str, &nodes, &slots_nodes);
+  // 解析节点信息字符串
+  ClusterNodes nodes;                                            // 节点信息映射表 [ node_id -> ClusterNode ]
+  std::unordered_map<int, std::string> slots_nodes;              // 槽位分配映射表 [ slot -> node_id ]
+  Status s = parseClusterNodes(nodes_str, &nodes, &slots_nodes); // 执行解析
   if (!s.IsOK()) return s;
 
-  // Update version and cluster topology
+  // 更新集群版本和拓扑结构
   version_ = version;
   nodes_ = nodes;
   size_ = 0;
 
-  // Update slots to nodes
+  // 遍历每个 slot 及其绑定的 node
   for (const auto &[slot, node_id] : slots_nodes) {
+    // 更新 slot => node 映射
     slots_nodes_[slot] = nodes_[node_id];
   }
 
-  // Update replicas info and size
+  // 遍历集群每个 node
   for (const auto &[node_id, node] : nodes_) {
+    // 把 slave 绑定到 master
     if (node->role == kClusterSlave) {
       if (nodes_.find(node->master_id) != nodes_.end()) {
         nodes_[node->master_id]->replicas.push_back(node_id);
       }
     }
+    // 统计有槽位的主节点数
     if (node->role == kClusterMaster && node->slots.count() > 0) {
       size_++;
     }
   }
 
+  // 获取当前节点 node_id ，存入 myid_
   if (myid_.empty() || force) {
     for (const auto &[node_id, node] : nodes_) {
       if (node->port == port_ && util::MatchListeningIP(binds_, node->host)) {
@@ -196,17 +225,18 @@ Status Cluster::SetClusterNodes(const std::string &nodes_str, int64_t version, b
     }
   }
 
+  // 获取当前节点 node ，存入 myself_
   myself_ = nullptr;
   if (!myid_.empty() && nodes_.find(myid_) != nodes_.end()) {
     myself_ = nodes_[myid_];
   }
 
-  // Set replication relationship
+  // 建立主从复制关系
   if (auto s = SetMasterSlaveRepl(); !s.IsOK()) {
     return s.Prefixed("failed to set master-replica replication");
   }
 
-  // Clear data of migrated slots
+  // 清理已迁移槽位的数据
   if (!migrated_slots_.empty()) {
     engine::Context ctx(srv_->storage);
     for (const auto &[slot, _] : migrated_slots_) {
@@ -218,7 +248,8 @@ Status Cluster::SetClusterNodes(const std::string &nodes_str, int64_t version, b
       }
     }
   }
-  // Clear migrated and imported slot info
+
+  // 清除迁移/导入槽位记录
   migrated_slots_.clear();
   imported_slots_.clear();
 
@@ -732,41 +763,69 @@ Status Cluster::LoadClusterNodes(const std::string &file_path) {
   return SetClusterNodes(nodes_info, version, false);
 }
 
-Status Cluster::parseClusterNodes(const std::string &nodes_str, ClusterNodes *nodes,
+/**
+ * 解析集群节点信息字符串
+ *
+ * @param nodes_str 输入-集群节点字符串（多行），每行表示一个节点
+ * @param nodes 输出-节点信息映射表 [ node_id -> ClusterNode ]
+ * @param slots_nodes 输出-槽位分配映射表 [ slot -> node_id ]
+ *
+ * @return 执行状态，成功返回OK，失败返回错误信息
+ *
+ * 功能说明：
+ * 1. 解析集群节点信息字符串，构建节点拓扑结构
+ * 2. 验证节点信息的完整性和有效性
+ * 3. 记录槽位分配关系
+ *
+ * 输入字符串格式示例：
+ * <node_id> <host> <port> <role> <master_id> [<slot_range>...]
+ *
+ * master: aaaaa 127.0.0.1 6379 master - 0-5460 5461-10922 ，对于 master 节点 <master_id> 字段为 - ；
+ * slave: bbbbb 127.0.0.1 6380 slave aaaaa...aaaa ，对于 slave 节点 slot range 数组为空，因为 slave 节点不会持有槽位；
+ *
+ * 字段说明：
+ * 1. node_id: 40 字符长度的节点 ID
+ * 2. host/port: 节点地址
+ * 3. role: 节点角色(master/slave/replica)
+ * 4. master_id: 主节点 ID (从节点需要)
+ * 5. slot_range: 槽位范围(主节点需要)，可以是单个槽位或范围(如 0 或 0-8191)
+ */
+Status Cluster::parseClusterNodes(const std::string &nodes_str,
+                                  ClusterNodes *nodes,
                                   std::unordered_map<int, std::string> *slots_nodes) {
+  // 按行切分节点
   std::vector<std::string> nodes_info = util::Split(nodes_str, "\n");
   if (nodes_info.empty()) {
     return {Status::ClusterInvalidInfo, errInvalidClusterNodeInfo};
   }
 
-  nodes->clear();
+  nodes->clear(); // 清空输出参数
 
-  // Parse all nodes
+  // 逐个解析节点
   for (const auto &node_str : nodes_info) {
+    // 按空格分拆字段
     std::vector<std::string> fields = util::Split(node_str, " ");
-    if (fields.size() < 5) {
+    if (fields.size() < 5) { // 至少需要5个字段
       return {Status::ClusterInvalidInfo, errInvalidClusterNodeInfo};
     }
 
-    // 1) node id
-    if (fields[0].size() != kClusterNodeIdLen) {
+    /* 1. 解析节点ID */
+    if (fields[0].size() != kClusterNodeIdLen) { // 节点 ID 必须是固定长度，40字符
       return {Status::ClusterInvalidInfo, errInvalidNodeID};
     }
-
     std::string id = fields[0];
 
-    // 2) host, TODO(@shooterit): check host is valid
-    std::string host = fields[1];
+    /* 2. 解析主机地址 */
+    std::string host = fields[1]; // TODO: 需要增加host有效性检查
 
-    // 3) port
+    /* 3. 解析端口号 */
     auto parse_result = ParseInt<uint16_t>(fields[2], 10);
     if (!parse_result) {
       return {Status::ClusterInvalidInfo, "Invalid cluster node port"};
     }
-
     int port = *parse_result;
 
-    // 4) role
+    /* 4. 解析节点角色 */
     int role = 0;
     if (util::EqualICase(fields[3], "master")) {
       role = kClusterMaster;
@@ -776,65 +835,82 @@ Status Cluster::parseClusterNodes(const std::string &nodes_str, ClusterNodes *no
       return {Status::ClusterInvalidInfo, "Invalid cluster node role"};
     }
 
-    // 5) master id
+    /* 5. 解析主节点ID */
     std::string master_id = fields[4];
+    // 主节点 master_id 必须为 "-" ，从节点必须为有效节点 ID
     if ((role == kClusterMaster && master_id != "-") ||
         (role == kClusterSlave && master_id.size() != kClusterNodeIdLen)) {
       return {Status::ClusterInvalidInfo, errInvalidNodeID};
     }
 
-    std::bitset<kClusterSlots> slots;
+    std::bitset<kClusterSlots> slots; // 初始化槽位位图
+
+    /* 处理从节点(不需要槽位信息) */
     if (role == kClusterSlave) {
-      if (fields.size() != 5) {
+      if (fields.size() != 5) { // 从节点只能有5个字段
         return {Status::ClusterInvalidInfo, errInvalidClusterNodeInfo};
-      } else {
-        // Create slave node
-        (*nodes)[id] = std::make_shared<ClusterNode>(id, host, port, role, master_id, slots);
-        continue;
       }
+      // 创建从节点对象并保存到映射表中
+      (*nodes)[id] = std::make_shared<ClusterNode>(id, host, port, role, master_id, slots);
+      // 因为从节点不包含 slot range ，直接处理下一个节点
+      continue;
     }
 
-    // 6) slot info
-    auto valid_range = NumericRange<int>{0, kClusterSlots - 1};
-    const std::regex node_id_regex(R"(\b[a-fA-F0-9]{40}\b)");
+    /* 6. 处理主节点的槽位分配信息 */
+    auto valid_range = NumericRange<int>{0, kClusterSlots - 1};  // 槽位有效范围
+    const std::regex node_id_regex(R"(\b[a-fA-F0-9]{40}\b)"); // 节点 ID 正则，正则检查避免 node_id 粘连导致 slot 误识别
+
+    // 遍历槽位信息字段(从第 6 个字段开始)
     for (unsigned i = 5; i < fields.size(); i++) {
       std::vector<std::string> ranges = util::Split(fields[i], "-");
+
+      /* 情况 A：单个槽位，如 "1024" */
       if (ranges.size() == 1) {
+        // 检查是否是误写的节点ID
         if (std::regex_match(fields[i], node_id_regex)) {
-          return {Status::ClusterInvalidInfo, "Invalid nodes definition: Missing newline between node entries."};
+          return {Status::ClusterInvalidInfo,
+                  "Invalid nodes definition: Missing newline between node entries."};
         }
 
+        // 解析槽位号
         auto parse_start = ParseInt<int>(ranges[0], valid_range, 10);
         if (!parse_start) {
           return {Status::ClusterInvalidInfo, errSlotOutOfRange};
         }
-
         int start = *parse_start;
+
+        // 设置槽位位图
         slots.set(start, true);
         if (role == kClusterMaster) {
+          // 查看 slot -> node_id 映射表，检查槽位是否已分配；若某个槽已被其他节点声明则报错，确保槽位不会重叠。
           if (slots_nodes->find(start) != slots_nodes->end()) {
             return {Status::ClusterInvalidInfo, errSlotOverlapped};
-          } else {
-            (*slots_nodes)[start] = id;
           }
+          // 若未分配，更新 slot -> node_id 映射表
+          (*slots_nodes)[start] = id;
         }
-      } else if (ranges.size() == 2) {
+      }
+      /* 情况 B：slot 范围，如 "0-8191" */
+      else if (ranges.size() == 2) {
+        // 解析起始和结束槽位
         auto parse_start = ParseInt<int>(ranges[0], valid_range, 10);
         auto parse_stop = ParseInt<int>(ranges[1], valid_range, 10);
         if (!parse_start || !parse_stop || *parse_start >= *parse_stop) {
           return {Status::ClusterInvalidInfo, errSlotOutOfRange};
         }
 
+        // 设置范围内的所有槽位
         int start = *parse_start;
         int stop = *parse_stop;
         for (int j = start; j <= stop; j++) {
           slots.set(j, true);
           if (role == kClusterMaster) {
+            // 查看 slot -> node_id 映射表，检查槽位是否已分配；若某个槽已被其他节点声明则报错，确保槽位不会重叠。
             if (slots_nodes->find(j) != slots_nodes->end()) {
               return {Status::ClusterInvalidInfo, errSlotOverlapped};
-            } else {
-              (*slots_nodes)[j] = id;
             }
+            // 更新 slot -> node_id 映射表
+            (*slots_nodes)[j] = id;
           }
         }
       } else {
@@ -842,7 +918,7 @@ Status Cluster::parseClusterNodes(const std::string &nodes_str, ClusterNodes *no
       }
     }
 
-    // Create master node
+    // 创建主节点对象
     (*nodes)[id] = std::make_shared<ClusterNode>(id, host, port, role, master_id, slots);
   }
 
