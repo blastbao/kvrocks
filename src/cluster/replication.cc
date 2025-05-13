@@ -491,17 +491,111 @@ ReplicationThread::CBState ReplicationThread::replConfReadCB(bufferevent *bev) {
   }
 }
 
+// 首次全量同步
+//
+// 1. 建立连接与握手
+//  步骤 1：从节点连接主节点
+//    从节点启动后，向主节点发送连接请求（通过 replicaof 命令配置的主节点 IP 和端口）。
+//    如果主节点需要认证（requirepass 配置），从节点会先发送 AUTH 命令验证身份。
+//  步骤 2：发送 PSYNC 命令
+//    从节点尝试发起部分同步请求（即使首次同步也会尝试）：
+//    PSYNC ? -1
+//    参数说明：
+//      --- ? 表示 replid 未知（首次同步必然未知）
+//      --- -1 表示复制偏移量 offset 未知（首次同步必然为 -1）
+//    返回值：
+//      主节点响应：
+//        如果主节点不支持 PSYNC 或无法满足部分同步条件（首次同步必然不满足，会触发全量同步），会返回：
+//          +FULLRESYNC <replid> <offset>
+//        其中：
+//          --- <replid>：主节点的当前复制 ID（40 字节随机字符串）。
+//          --- <offset>：主节点当前的复制偏移量（通常是 0 或初始值）。
+//        此时，从节点会保存这两个信息，用于后续的增量同步。
+//
+// 2. 如果触发全量同步，主节点准备全量数据（RDB 快照）
+//  步骤 3：主节点生成 RDB 文件
+//    主节点调用 fork() 创建子进程，生成当前数据集的 RDB 快照（内存数据的磁盘持久化文件）。
+//    注意：此时主节点仍能处理写命令，新写入的数据会缓存在内存缓冲区（repl_backlog）中，待 RDB 传输完成后同步给从节点。
+//  步骤 4：发送 RDB 文件
+//    主节点通过已建立的连接将 RDB 文件流式传输给从节点：
+//    先发送 $<length>\r\n 声明文件大小（如 $12345\r\n）。
+//    再发送 RDB 文件内容（二进制数据流）。
+// 3. 从节点加载 RDB 数据
+//  步骤 5：从节点接收并加载 RDB
+//    从节点收到 RDB 文件后：
+//      --- 清空自身旧数据（如果是重新同步）。
+//      --- 加载 RDB 文件到内存中，重建完整数据集。
+//      --- 更新复制状态：记录主节点的 replid 和 offset（来自之前的 +FULLRESYNC 响应）。
+//  步骤 6：追赶缓冲区数据
+//    在 RDB 生成期间，主节点可能已收到新的写命令（缓存在 repl_backlog 缓冲区）。
+//    主节点会将缓冲区的写命令（以 Redis 协议格式）发送给从节点，从节点依次执行这些命令，最终与主节点数据完全一致。
+// 4. 进入增量同步状态
+//  全量同步完成后，主从节点进入 增量同步（PSYNC） 模式：
+//    --- 主节点将后续收到的写命令实时转发给从节点。
+//    --- 从节点通过 replid 和 offset 标识同步位置。
+//
+// Q: 主节点准备全量数据（RDB 快照），这个要把所有存储 dump 一份到独立文件或者目录中吗？？？
+// A:
+//    对于 redis 来说，在执行全量同步前会生成一个 RDB 文件（快照），可以使用已有的 RDB 文件（若它足够新）或者通过 fork() 出子进程，创建一个新的 RDB 文件；
+//    对于 kvrocks 来说，它利用了 RocksDB 的 immutability 特性（SST 文件一旦生成就不会变），不需要 dump 一份新数据，选定当前可用于同步的 SST 文件列表即可。
+//
+// Q: 当 Redis 正在创建 RDB 文件时（通常在主从复制或 BGSAVE），这时客户端还在不断写入数据，那：
+//    --- RDB 文件里的数据会不会和内存里的数据不一致？
+//    --- 这些写入中的数据会不会丢失或漏同步？
+// A:
+//  Redis 会在主进程内存的当前状态下，fork 出一个子进程来生成 RDB。
+//  因为 fork 是写时复制（Copy-On-Write），所以 子进程看到的是 fork 时刻的“冻结快照”。
+//  后续主进程对数据的修改，并不会影响子进程看到的那份数据。
+//
+//  Redis 主进程不会暂停服务，仍然响应客户端的写入命令。
+//  主进程将这些写入请求写入 replication backlog（复制缓冲区），这部分数据不会进入正在生成的 RDB 文件中。
+//  主进程生成 RDB 文件后，通过 socket 传给从节点，从节点加载这个快照。
+//  主进程随后把 backlog 中积累的命令（RDB 生成期间的写操作）继续发送给从节点，确保一致性。
+//
+// Q: RDB 生成期间大量写入会导致内存暴涨吗？
+// A: COW 机制仅复制被修改的内存页，通常只有部分数据页需要复制。
+//    但若所有数据都被修改，则最多占用 2 倍内存（原始数据 + 修改后的副本）。
+//
+// Q: 如果 repl_backlog 溢出怎么办？
+// A: 从节点无法从缓冲区获取完整的增量命令，主节点会触发二次全量同步（通过日志提示 Backlog overflow）。
+//
+// Q: 如何优化大内存实例的 RDB 生成？
+// A: 使用 无盘复制（repl-diskless-sync yes）避免磁盘 IO；增大 repl-backlog-size（如 512MB）。
+//
+// Q: Kvrocks 的复制思想 vs Redis
+// A:
+//  1. 数据快照（替代 RDB）
+//    - Kvrocks 利用 RocksDB 的 Snapshot 特性获取某一时刻的 KV 数据一致性视图，无需 fork()，避免 Redis 因大内存实例 fork() 导致的延迟问题。
+//    - Kvrocks 通过 RocksDB 的 Checkpoint 功能将 Snapshot 数据导出为独立文件（类似 RDB），但无 COW 内存开销：
+//  2. 主从同步（替代 PSYNC）
+//    - 全量同步：主节点创建 RocksDB 快照，生成 Checkpoint 文件发送给从节点；从节点加载 Checkpoint 初始化数据。
+//    - 增量同步：RocksDB 的所有写操作会先记录到 WAL 日志，主节点将 WAL 中的新操作实时发送给从节点（通过 序列号（Sequence Number） 标识位置，从节点按顺序重放 WAL 命令。
+//    因为直接通过 WAL 同步，不需要 redis 的 repl_backlog 。
+//
+// Q: Kvrocks 将 Snapshot 数据导出为独立文件（类似 RDB），是否需要拷贝当前全量数据？
+// A: 通过 RocksDB 的 硬链接（Hard Link） 和 SST 文件复用 机制，不需要完整拷贝全量数据。
+//    完整同步流程
+//    1. 创建 Snapshot：
+//        RocksDB 通过 GetSnapshot() 获取一致性视图，逻辑上锁定当前数据状态。
+//    2. 生成 Checkpoint：
+//      - SST 文件：通过硬链接复用现有文件（如 000123.sst → backup/000123.sst）。
+//      - MemTable：强制刷新为新的 SST 文件并链接到 Checkpoint 目录。
+//      - MANIFEST：拷贝元数据文件（记录文件组织方式）。
+//    3. 传输 Checkpoint：
+//        Kvrocks 将 Checkpoint 目录打包或直接发送给从节点，从节点加载这些文件完成全量同步。
 ReplicationThread::CBState ReplicationThread::tryPSyncWriteCB(bufferevent *bev) {
-  auto cur_seq = storage_->LatestSeqNumber();
-  auto next_seq = cur_seq + 1;
+  // 1. 获取当前最新的 WAL 序列号并计算下一个期望序列号
+  auto cur_seq = storage_->LatestSeqNumber(); // 本地最新的 WAL 写入序号。
+  auto next_seq = cur_seq + 1;                // 期望从主节点请求的增量数据起点。
   std::string replid;
 
   // Get replication id
+  // 2. 获取复制 ID
   std::string replid_in_wal = storage_->GetReplIdFromWalBySeq(cur_seq);
   // Set if valid replication id
-  if (replid_in_wal.length() == kReplIdLength) {
+  if (replid_in_wal.length() == kReplIdLength) {    // 优先使用WAL中的复制ID(如果有效)
     replid = replid_in_wal;
-  } else {
+  } else {  // WAL中没有有效ID时，尝试从数据库引擎获取
     // Maybe there is no WAL, we can get replication id from db since master
     // always write replication id into db before any operation when starting
     // new "replication history".
@@ -513,46 +607,82 @@ ReplicationThread::CBState ReplicationThread::tryPSyncWriteCB(bufferevent *bev) 
 
   // To adapt to old master using old PSYNC, i.e. only use next sequence id.
   // Also use old PSYNC if replica can't find replication id from WAL and DB.
-  if (!srv_->GetConfig()->use_rsid_psync || next_try_old_psync_ || replid.length() != kReplIdLength) {
+  //
+  // 3. 决定使用哪种 PSYNC 协议版本
+  if (!srv_->GetConfig()->use_rsid_psync || // 强制使用旧版
+      next_try_old_psync_ ||                // 上次主节点返回了“不支持新版 PSYNC”的错误
+      replid.length() != kReplIdLength) {   // 无法获得合法长度的 replid
     next_try_old_psync_ = false;  // Reset next_try_old_psync_
+    // 发送旧版PSYNC命令(仅包含序列号)
     SendString(bev, redis::ArrayOfBulkStrings({"PSYNC", std::to_string(next_seq)}));
     info("[replication] Try to use psync, next seq: {}", next_seq);
   } else {
     // NEW PSYNC "Unique Replication Sequence ID": replication id and sequence id
+    // 发送新版PSYNC命令(包含复制ID+序列号)
     SendString(bev, redis::ArrayOfBulkStrings({"PSYNC", replid, std::to_string(next_seq)}));
     info("[replication] Try to use new psync, current unique replication sequence id: {}:{}", replid, cur_seq);
   }
+
+  // 4. 更新复制状态并进入下一步
   repl_state_.store(kReplSendPSync, std::memory_order_relaxed);
-  return CBState::NEXT;
+  return CBState::NEXT; // 进入下一个状态(等待主节点响应)
 }
 
+
+
+// PSYNC 是 Redis/Kvrocks 用于主从增量复制的命令，从节点发送给主节点，并根据响应决定下一步状态：
+//
+// PSYNC 响应：
+//  响应样例	        含义
+//  +OK	                增量同步成功，可以进入增量复制状态
+//  -LOADING ...	主库正在恢复数据，暂时无法同步
+//  -FULLRESYNC ...	主库拒绝增量同步，需要执行全量复制
+//  -TRY_OLD_PSYNC	主库不支持新版 PSYNC，需要重试旧协议
+//
+//
+// 状态机处理逻辑：
+//  返回状态	触发条件	                                        后续动作
+//  AGAIN	缓冲区中没有完整行数据	                        继续保持当前状态，等待更多数据
+//  RESTART	主节点正在恢复数据库(-MASTERDB is restoring)	稍后重新尝试PSYNC
+//  PREV	旧版本主节点无法处理新PSYNC协议(-WRONGPSYNCNUM)	回退状态并使用旧版PSYNC协议重试
+//  QUIT	PSYNC失败(非OK响应)	                        退出增量同步流程，启动全量同步(fullsync_steps_)
+//  NEXT	PSYNC成功(收到+OK响应)	                        进入增量同步批处理循环
+
+
+
 ReplicationThread::CBState ReplicationThread::tryPSyncReadCB(bufferevent *bev) {
+  // 从主节点读取一行数据（以 CRLF 结束）
   auto input = bufferevent_get_input(bev);
   UniqueEvbufReadln line(input, EVBUFFER_EOL_CRLF_STRICT);
-  if (!line) return CBState::AGAIN;
+  if (!line) return CBState::AGAIN; // 没读完，继续等待
 
+  // 如果返回 -LOADING 类错误，说明主库正在恢复数据，需要稍后重试
   if (line[0] == '-' && isRestoringError(line.View())) {
     warn("The master was restoring the db, retry later");
-    return CBState::RESTART;
+    return CBState::RESTART; // 返回 CBState::RESTART，上层会稍后重试连接。
   }
 
+  // 主节点不支持新版 PSYNC 协议
   if (line[0] == '-' && isWrongPsyncNum(line.View())) {
-    next_try_old_psync_ = true;
+    next_try_old_psync_ = true; // 下一次尝试使用旧版 PSYNC 方式
     warn("The old version master, can't handle new PSYNC, try old PSYNC again");
     // Retry previous state, i.e. send PSYNC again
-    return CBState::PREV;
+    return CBState::PREV;   // 返回 CBState::PREV，表示回退到上一个状态（再发一次兼容的 PSYNC 命令）。
   }
 
+  // 如果响应不是 +OK（比如 -FULLRESYNC），就说明不支持增量同步。
   if (!ResponseLineIsOK(line.View())) {
     // PSYNC isn't OK, we should use FullSync
     // Switch to fullsync state machine
-    fullsync_steps_.Start();
+    fullsync_steps_.Start(); // 进入全量复制流程
     info("[replication] Failed to psync, error: {}, switch to fullsync", line.get());
-    return CBState::QUIT;
+    return CBState::QUIT; // 返回 CBState::QUIT 表示需要切换状态机
   } else {
+    // 响应是 +OK，主节点接受增量复制。
+
     // PSYNC is OK, use IncrementBatchLoop
     info("[replication] PSync is ok, start increment batch loop");
-    return CBState::NEXT;
+    return CBState::NEXT; // 返回 CBState::NEXT，状态机进入增量同步主循环。
   }
 }
 
