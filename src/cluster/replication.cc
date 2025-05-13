@@ -129,6 +129,8 @@ void FeedSlaveThread::loop() {
   uint32_t yield_microseconds = 2 * 1000;
   std::string batches_bulk;
   size_t updates_in_batches = 0;
+
+  // 每次 loop 都要检查是否已经设置了停止标记
   while (!IsStopped()) {
     auto curr_seq = next_repl_seq_.load();
 

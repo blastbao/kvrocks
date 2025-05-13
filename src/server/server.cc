@@ -330,12 +330,13 @@ Status Server::RemoveMaster() {
 }
 
 Status Server::AddSlave(redis::Connection *conn, rocksdb::SequenceNumber next_repl_seq) {
+  // 创建并启动主节点上的增量变更同步线程
   auto t = std::make_unique<FeedSlaveThread>(this, conn, next_repl_seq);
   auto s = t->Start();
   if (!s.IsOK()) {
     return s;
   }
-
+  // 将线程 tid 保存到数组中
   std::lock_guard<std::mutex> lg(slave_threads_mu_);
   slave_threads_.emplace_back(std::move(t));
   return Status::OK();
@@ -343,11 +344,11 @@ Status Server::AddSlave(redis::Connection *conn, rocksdb::SequenceNumber next_re
 
 void Server::DisconnectSlaves() {
   std::lock_guard<std::mutex> lg(slave_threads_mu_);
-
+  // 逐个停止增量同步线程
   for (auto &slave_thread : slave_threads_) {
     if (!slave_thread->IsStopped()) slave_thread->Stop();
   }
-
+  // 逐个 join 回收线程资源
   while (!slave_threads_.empty()) {
     auto slave_thread = std::move(slave_threads_.front());
     slave_threads_.pop_front();
