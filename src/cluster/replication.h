@@ -148,7 +148,7 @@ class ReplicationThread : private EventCallbackBase<ReplicationThread> {
     void SetWriteCB(bufferevent *bev, bufferevent_data_cb cb);
 
    private:
-    bufferevent *bev_ = nullptr;                // 缓冲事件
+    bufferevent *bev_ = nullptr;                // libevent.bufferevent 对象，管理 Socket 的读写事件和缓冲区。
     ReplicationThread *repl_;                   // 所属复制线程
     CallbackList handlers_;                     // 回调处理列表
     CallbackList::size_type handler_idx_ = 0;   // 当前处理索引
@@ -196,8 +196,8 @@ class ReplicationThread : private EventCallbackBase<ReplicationThread> {
   size_t incr_bulk_len_ = 0;  // 批量数据长度
 
   // 状态机实例
-  CallbacksStateMachine psync_steps_;   // PSYNC步骤状态机
-  CallbacksStateMachine fullsync_steps_; // 全量同步步骤状态机
+  CallbacksStateMachine psync_steps_;     // PSYNC 步骤状态机
+  CallbacksStateMachine fullsync_steps_;  // 全量同步步骤状态机
 
   // 主方法
   void run();

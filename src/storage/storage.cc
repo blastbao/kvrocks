@@ -1076,6 +1076,7 @@ std::shared_lock<std::shared_mutex> Storage::ReadLockGuard() { return std::share
 
 std::unique_lock<std::shared_mutex> Storage::WriteLockGuard() { return std::unique_lock(db_rw_lock_); }
 
+// [重要]
 Status Storage::ReplDataManager::GetFullReplDataInfo(Storage *storage, std::string *files) {
   auto guard = storage->ReadLockGuard();
   if (storage->IsClosing()) return {Status::NotOK, "DB is closing"};
@@ -1096,8 +1097,7 @@ Status Storage::ReplDataManager::GetFullReplDataInfo(Storage *storage, std::stri
 
     // Create checkpoint of rocksdb
     uint64_t checkpoint_latest_seq = 0;
-    s = checkpoint->CreateCheckpoint(data_files_dir, storage->config_->rocks_db.write_buffer_size * MiB,
-                                     &checkpoint_latest_seq);
+    s = checkpoint->CreateCheckpoint(data_files_dir, storage->config_->rocks_db.write_buffer_size * MiB,&checkpoint_latest_seq);
     auto now_secs = util::GetTimeStamp<std::chrono::seconds>();
     storage->checkpoint_info_.create_time_secs = now_secs;
     storage->checkpoint_info_.access_time_secs = now_secs;
@@ -1136,7 +1136,6 @@ Status Storage::ReplDataManager::GetFullReplDataInfo(Storage *storage, std::stri
   storage->env_->GetChildren(data_files_dir, &result);
   for (const auto &f : result) {
     if (f == "." || f == "..") continue;
-
     files->append(f);
     files->push_back(',');
   }

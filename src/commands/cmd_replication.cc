@@ -32,6 +32,7 @@ namespace redis {
 
 class CommandPSync : public Commander {
  public:
+
   Status Parse(const std::vector<std::string> &args) override {
     size_t seq_arg = 1;
     if (args.size() == 3) {
@@ -65,6 +66,7 @@ class CommandPSync : public Commander {
     bool need_full_sync = false;
 
     // Check replication id of the last sequence log
+    // 检查 WAL 中是否存在指定 seq 对应的 repl_id
     if (new_psync_ && srv->GetConfig()->use_rsid_psync) {
       std::string replid_in_wal = srv->storage->GetReplIdFromWalBySeq(next_repl_seq_ - 1);
       info("Replication id in WAL: {}", replid_in_wal);
@@ -73,11 +75,12 @@ class CommandPSync : public Commander {
       // Or WAL may have nothing when starting from db of old version kvrocks.
       if (replid_in_wal.length() == kReplIdLength && replid_in_wal != replica_replid_) {
         *output = "wrong replication id of the last log";
-        need_full_sync = true;
+        need_full_sync = true; // 需要全量同步
       }
     }
 
     // Check Log sequence
+    // 检查 seq 是否在 WAL 范围内
     if (!need_full_sync && !checkWALBoundary(srv->storage, next_repl_seq_).IsOK()) {
       *output = "sequence out of range, please use fullsync";
       need_full_sync = true;
@@ -343,6 +346,7 @@ class CommandDBName : public Commander {
     return Status::OK();
   }
 };
+
 
 REDIS_REGISTER_COMMANDS(Replication, MakeCmdAttr<CommandReplConf>("replconf", -3, "read-only no-script", NO_KEY),
                         MakeCmdAttr<CommandPSync>("psync", -2, "read-only no-multi no-script", NO_KEY),

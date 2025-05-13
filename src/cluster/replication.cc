@@ -103,6 +103,24 @@ void FeedSlaveThread::checkLivenessIfNeed() {
   }
 }
 
+// 主节点 FeedSlave 线程持续从 WAL 读取写入日志变更，并打包成 Redis 协议格式，通过 socket 发送给从节点。
+//
+// Kvrocks 主节点在同步数据给从节点时，不会每产生一条 WAL 日志就立即发送，而是会：
+//  - 累积多个日志批次（Batch） 合并成一个更大的数据包（batches_bulk）。
+//  - 达到以下条件之一时才真正发送：
+//    - 数据包大小超过 kMaxDelayBytes（如 16KB）。
+//    - 累积的操作数（如 SET/DEL）超过 kMaxDelayUpdates。
+//    - 当前处理的日志序列号（batch.sequence）接近最新日志序列号（即 LatestSeqNumber() - batch.sequence <= kMaxDelayUpdates）。
+//
+// Q: 当前处理的日志序列号(batch.sequence) 已经接近最新日志序列号(LatestSeqNumber) 时, 不是意味着实时性很高吗，为何急于发送？
+// A:
+//   当前处理的日志接近最新日志，说明主从同步的 “实时性” 很高，此时从逻辑上看确实不应该着急发。
+//   分布式系统中，批量处理常面临最后少量数据因不满足批量条件而滞留的问题，尤其是流量低的时候，可能导致接收方永远等不到数据；
+//   Kvrocks 的思考逻辑是：既然剩下的数据已经少到不值得等待攒批，立即发送以保障实时性下限。
+//   Kvrocks 判断条件 LatestSeqNumber - batch.sequence ≤ kMaxDelayUpdates 是在检测复制追赶情况：
+//    - 复制落后较多时，优先批量打包，提高吞吐量
+//    - 复制即将追上时，优先及时发送，降低延迟
+//
 void FeedSlaveThread::loop() {
   // is_first_repl_batch was used to fix that replication may be stuck in a dead loop
   // when some seqs might be lost in the middle of the WAL log, so forced to replicate
@@ -114,26 +132,35 @@ void FeedSlaveThread::loop() {
   while (!IsStopped()) {
     auto curr_seq = next_repl_seq_.load();
 
+    // 检查 WAL 是否可读
     if (!iter_ || !iter_->Valid()) {
-      if (iter_) info("WAL was rotated, would reopen again");
-      if (!srv_->storage->WALHasNewData(curr_seq) || !srv_->storage->GetWALIter(curr_seq, &iter_).IsOK()) {
+      // 若迭代器无效（如首次运行或 WAL 被回收），尝试创建新的 WAL 迭代器。
+      if (iter_)
+        info("WAL was rotated, would reopen again");
+      // 若无新数据或迭代器创建失败，休眠并检查从节点存活状态后继续循环。
+      if (!srv_->storage->WALHasNewData(curr_seq) ||
+          !srv_->storage->GetWALIter(curr_seq, &iter_).IsOK()
+      ) {
         iter_ = nullptr;
         usleep(yield_microseconds);
         checkLivenessIfNeed();
         continue;
       }
     }
+
+
     // iter_ would be always valid here
     auto batch = iter_->GetBatch();
     if (batch.sequence != curr_seq) {
-      error(
-          "Fatal error encountered, WAL iterator is discrete, some seq might be lost, sequence {} expected, but got {}",
-          curr_seq, batch.sequence);
+      // 如果当前日志序列号与预期不一致，说明日志中间丢失了部分写操作，主从之间的数据无法保持一致，只能中止复制。
+      error("Fatal error encountered, WAL iterator is discrete, some seq might be lost, sequence {} expected, but got {}",curr_seq, batch.sequence);
       Stop();
       return;
     }
-    updates_in_batches += batch.writeBatchPtr->Count();
-    batches_bulk += redis::BulkString(batch.writeBatchPtr->Data());
+
+    updates_in_batches += batch.writeBatchPtr->Count();                   // 累计当前 Batch 中的操作数
+    batches_bulk += redis::BulkString(batch.writeBatchPtr->Data());  // 将 Batch 转为 Redis 协议格式（BulkString），存入临时缓冲区
+
     // 1. We must send the first replication batch, as said above.
     // 2. To avoid frequently calling 'write' system call to send replication stream,
     //    we pack multiple batches into one big bulk if possible, and only send once.
@@ -143,26 +170,47 @@ void FeedSlaveThread::loop() {
     // 3. To avoid master don't send replication stream to slave since of packing
     //    batches strategy, we still send batches if current batch sequence is less
     //    kMaxDelayUpdates than latest sequence.
-    if (is_first_repl_batch || batches_bulk.size() >= kMaxDelayBytes || updates_in_batches >= kMaxDelayUpdates ||
+    //
+    // 发送条件（满足任一即发送）：
+    //  - 第一批数据强制发送
+    //  - 缓冲区数据量大小超过阈值（默认 16KB）
+    //  - 缓冲区数据条数超过阈值（默认数十条）
+    //  - 当前进度距离最新日志太近，避免“打包策略”导致 slave 长时间没收到数据
+    // 设计目的：
+    //  - 减少网络调用：批量发送，提升吞吐量。
+    //  - 控制延迟：避免因等待攒批导致从节点数据过旧，确保实时性。
+    if (is_first_repl_batch ||
+        batches_bulk.size() >= kMaxDelayBytes ||
+        updates_in_batches >= kMaxDelayUpdates ||
         srv_->storage->LatestSeqNumber() - batch.sequence <= kMaxDelayUpdates) {
+
       // Send entire bulk which contain multiple batches
+      // 将缓冲区数据 batches_bulk 发送给从节点
       auto s = util::SockSend(conn_->GetFD(), batches_bulk, conn_->GetBufferEvent());
       if (!s.IsOK()) {
         error("Write error while sending batch to slave: {}. batches: 0x{}", s.Msg(), util::StringToHex(batches_bulk));
         Stop();
         return;
       }
+
+      // 重置缓冲区
       is_first_repl_batch = false;
       batches_bulk.clear();
       if (batches_bulk.capacity() > kMaxDelayBytes * 2) batches_bulk.shrink_to_fit();
       updates_in_batches = 0;
     }
+
+    // 确定下一个待复制的序号
     curr_seq = batch.sequence + batch.writeBatchPtr->Count();
     next_repl_seq_.store(curr_seq);
+
+    // 若 wal 无新数据，则休眠并检查从节点存活状态，如果从节点宕机则退出同步线程
     while (!IsStopped() && !srv_->storage->WALHasNewData(curr_seq)) {
       usleep(yield_microseconds);
       checkLivenessIfNeed();
     }
+
+    // 移动迭代器到下一个 Batch
     iter_->Next();
   }
 }
@@ -172,7 +220,11 @@ void SendString(bufferevent *bev, const std::string &data) {
   evbuffer_add(output, data.c_str(), data.length());
 }
 
+// 处理与主节点（Master）连接过程中发生的各种事件（如连接成功、错误或断开）
 void ReplicationThread::CallbacksStateMachine::ConnEventCB(bufferevent *bev, int16_t events) {
+  // 当 TCP 连接成功后，立即执行首次数据发送（例如发送认证密码或 PSYNC 命令）给 master 。
+  //  - 通过 bufferevent_getcb 获取当前设置的写回调函数
+  //  - 如果存在写回调如 authWriteCB 或 writePingCB，立即触发它
   if (events & BEV_EVENT_CONNECTED) {
     // call write_cb when connected
     bufferevent_data_cb write_cb = nullptr;
@@ -180,6 +232,12 @@ void ReplicationThread::CallbacksStateMachine::ConnEventCB(bufferevent *bev, int
     if (write_cb) write_cb(bev, this);
     return;
   }
+
+  // 错误或断开
+  //  - 记录错误日志：提示连接错误或对端关闭。
+  //  - 更新复制状态：将状态设为 kReplConnecting（表示需重新连接）。
+  //  - 休眠 1 秒：避免频繁重连（退避策略）。
+  //  - 重启连接：调用 Stop() 释放旧连接，再调用 Start() 重新发起连接。
   if (events & (BEV_EVENT_ERROR | BEV_EVENT_EOF)) {
     error("[replication] connection error/eof, reconnect the master");
     // Wait a bit and reconnect
@@ -190,16 +248,25 @@ void ReplicationThread::CallbacksStateMachine::ConnEventCB(bufferevent *bev, int
   }
 }
 
+// 配置 bufferevent 的读事件回调（当 Socket 可读时触发，用于接收主节点数据）。
 void ReplicationThread::CallbacksStateMachine::SetReadCB(bufferevent *bev, bufferevent_data_cb cb) {
   bufferevent_enable(bev, EV_READ);
-  bufferevent_setcb(bev, cb, nullptr, EventCallbackFunc<&CallbacksStateMachine::ConnEventCB>, this);
+  bufferevent_setcb(
+      bev,
+      cb,                                                     // 读回调
+      nullptr,                                                // 写回调
+      EventCallbackFunc<&CallbacksStateMachine::ConnEventCB>, // 事件回调（如连接断开）
+          this                                                  // 传递给回调的用户数据
+  );
 }
 
+// 配置 bufferevent 的写事件回调（当 Socket 可写时触发，用于向主节点发送数据）。
 void ReplicationThread::CallbacksStateMachine::SetWriteCB(bufferevent *bev, bufferevent_data_cb cb) {
   bufferevent_enable(bev, EV_WRITE);
   bufferevent_setcb(bev, nullptr, cb, EventCallbackFunc<&CallbacksStateMachine::ConnEventCB>, this);
 }
 
+// [重要]
 void ReplicationThread::CallbacksStateMachine::ReadWriteCB(bufferevent *bev) {
 LOOP_LABEL:
   assert(handler_idx_ <= handlers_.size());
@@ -243,12 +310,17 @@ LOOP_LABEL:
 void ReplicationThread::CallbacksStateMachine::Start() {
   struct bufferevent *bev = nullptr;
 
+  // 1. 空状态机直接返回
   if (handlers_.empty()) {
     return;
   }
 
   // Note: It may cause data races to use 'masterauth' directly.
   // It is acceptable because password change is a low frequency operation.
+  //
+  // 2. 如果配置了主节点密码（masterauth），在 handlers_ 头部插入 AUTH 读写回调
+  // 认证顺序：先发送密码（authWriteCB），再等待主节点响应（authReadCB）。
+  // 注意：这里提到 masterauth 的直接访问可能存在数据竞争，但密码修改是低频操作，因此可以接受。
   if (!repl_->srv_->GetConfig()->masterauth.empty()) {
     handlers_.emplace_front(CallbacksStateMachine::READ, "auth read", &ReplicationThread::authReadCB);
     handlers_.emplace_front(CallbacksStateMachine::WRITE, "auth write", &ReplicationThread::authWriteCB);
@@ -256,17 +328,21 @@ void ReplicationThread::CallbacksStateMachine::Start() {
 
   uint64_t last_connect_timestamp = 0;
 
+  // 3. 循环尝试连接主节点（失败则 sleep 1 秒）
   while (!repl_->stop_flag_ && bev == nullptr) {
     if (util::GetTimeStampMS() - last_connect_timestamp < 1000) {
       // prevent frequent re-connect when the master is down with the connection refused error
-      sleep(1);
+      sleep(1); // 避免频繁重连
     }
     last_connect_timestamp = util::GetTimeStampMS();
+    // 使用指定超时建立 TCP 连接
     auto cfd = util::SockConnect(repl_->host_, repl_->port_, repl_->srv_->GetConfig()->replication_connect_timeout_ms);
     if (!cfd) {
       error("[replication] Failed to connect the master, err: {}", cfd.Msg());
       continue;
     }
+
+    // 4. 创建 bufferevent（支持 TLS）
 #ifdef ENABLE_OPENSSL
     SSL *ssl = nullptr;
     if (repl_->srv_->GetConfig()->tls_replication) {
@@ -281,8 +357,10 @@ void ReplicationThread::CallbacksStateMachine::Start() {
       bev = bufferevent_socket_new(repl_->base_, *cfd, BEV_OPT_CLOSE_ON_FREE);
     }
 #else
+    // 使用 libevent 库创建一个基于 Socket 的 bufferevent 对象，其作用是将普通的 Socket 连接封装成事件驱动的非阻塞模式。
     bev = bufferevent_socket_new(repl_->base_, *cfd, BEV_OPT_CLOSE_ON_FREE);
 #endif
+
     if (bev == nullptr) {
 #ifdef ENABLE_OPENSSL
       if (ssl) SSL_free(ssl);
@@ -291,6 +369,7 @@ void ReplicationThread::CallbacksStateMachine::Start() {
       error("[replication] Failed to create the event socket");
       continue;
     }
+
 #ifdef ENABLE_OPENSSL
     if (repl_->srv_->GetConfig()->tls_replication) {
       bufferevent_openssl_set_allow_dirty_shutdown(bev, 1);
@@ -301,6 +380,11 @@ void ReplicationThread::CallbacksStateMachine::Start() {
     return;
   }
 
+  // 5. 设置事件驱动入口回调（读 or 写）
+  //  - 重置 handler_idx_ = 0 ，表示状态机从第一个 handler 开始执行；
+  //  - 设置增量复制状态为 Incr_batch_size（可能表示批量同步模式）。
+  //  - 根据第一个 handler 的类型（READ or WRITE），设置对应的事件回调函数。
+  //  - 保存 bufferevent 实例到 bev_ 供后续使用。
   handler_idx_ = 0;
   repl_->incr_state_ = Incr_batch_size;
   if (getHandlerEventType(0) == WRITE) {
@@ -319,31 +403,45 @@ void ReplicationThread::CallbacksStateMachine::Stop() {
 }
 
 ReplicationThread::ReplicationThread(std::string host, uint32_t port, Server *srv)
-    : host_(std::move(host)),
-      port_(port),
-      srv_(srv),
-      storage_(srv->storage),
-      repl_state_(kReplConnecting),
+    : host_(std::move(host)),           // 主节点 IP
+      port_(port),                      // 主节点 Port
+      srv_(srv),                        // Server 实例
+      storage_(srv->storage),           // 存储引擎
+      repl_state_(kReplConnecting),  // 复制线程的初始状态为 "正在连接主节点"
       psync_steps_(
           this,
           CallbacksStateMachine::CallbackList{
-              CallbackType{CallbacksStateMachine::WRITE, "dbname write", &ReplicationThread::checkDBNameWriteCB},
-              CallbackType{CallbacksStateMachine::READ, "dbname read", &ReplicationThread::checkDBNameReadCB},
-              CallbackType{CallbacksStateMachine::WRITE, "replconf write", &ReplicationThread::replConfWriteCB},
-              CallbackType{CallbacksStateMachine::READ, "replconf read", &ReplicationThread::replConfReadCB},
-              CallbackType{CallbacksStateMachine::WRITE, "psync write", &ReplicationThread::tryPSyncWriteCB},
-              CallbackType{CallbacksStateMachine::READ, "psync read", &ReplicationThread::tryPSyncReadCB},
-              CallbackType{CallbacksStateMachine::READ, "batch loop", &ReplicationThread::incrementBatchLoopCB}}),
+              CallbackType{CallbacksStateMachine::WRITE, "dbname write", &ReplicationThread::checkDBNameWriteCB}, // 发出本地 DB 名称
+              CallbackType{CallbacksStateMachine::READ, "dbname read", &ReplicationThread::checkDBNameReadCB},    // 读取主节点返回的 DB 名，检查一致性
+              CallbackType{CallbacksStateMachine::WRITE, "replconf write", &ReplicationThread::replConfWriteCB},  // 发送 REPLCONF 配置
+              CallbackType{CallbacksStateMachine::READ, "replconf read", &ReplicationThread::replConfReadCB},     // 读取 REPLCONF 响应
+              CallbackType{CallbacksStateMachine::WRITE, "psync write", &ReplicationThread::tryPSyncWriteCB},     // 向主节点发送 PSYNC 请求
+              CallbackType{CallbacksStateMachine::READ, "psync read", &ReplicationThread::tryPSyncReadCB},        // 等待主节点返回 +FULLRESYNC 或 +CONTINUE
+              CallbackType{CallbacksStateMachine::READ, "batch loop", &ReplicationThread::incrementBatchLoopCB}   // 增量同步循环读取主节点的变更数据
+          }
+      ),
       fullsync_steps_(
-          this, CallbacksStateMachine::CallbackList{
-                    CallbackType{CallbacksStateMachine::WRITE, "fullsync write", &ReplicationThread::fullSyncWriteCB},
-                    CallbackType{CallbacksStateMachine::READ, "fullsync read", &ReplicationThread::fullSyncReadCB}}) {}
+          this,
+          CallbacksStateMachine::CallbackList{
+              CallbackType{CallbacksStateMachine::WRITE, "fullsync write", &ReplicationThread::fullSyncWriteCB},  // 发送全量同步请求，请求主节点发送全量数据
+              CallbackType{CallbacksStateMachine::READ, "fullsync read", &ReplicationThread::fullSyncReadCB}      // 接收主节点发送的全量数据，RDB 或 SST 快照数据
+          }
+      ) {}
 
+// Start 函数是主从复制的总控开关，其核心职责包括：
+//  - 环境初始化（清理旧数据）。
+//  - 启动从节点上的复制线程。
+//  - 扩展点支持（通过回调函数）。
 Status ReplicationThread::Start(std::function<bool()> &&pre_fullsync_cb, std::function<void()> &&post_fullsync_cb) {
-  pre_fullsync_cb_ = std::move(pre_fullsync_cb);
-  post_fullsync_cb_ = std::move(post_fullsync_cb);
+  // 1. 注册回调函数，以支持在关键的复制阶段插入业务逻辑，增强灵活性。
+  pre_fullsync_cb_ = std::move(pre_fullsync_cb);   // 全量同步开始前执行（例如暂停外部服务请求）。
+  post_fullsync_cb_ = std::move(post_fullsync_cb); // 全量同步完成后执行（例如恢复服务或通知监控系统）。
 
   // Clean synced checkpoint from old master because replica starts to follow new master
+  //
+  // 2. 删除旧主节点留下的同步检查点目录（避免旧数据干扰新复制流程）
+  //  - sync_checkpoint_dir 是 RocksDB 检查点的存储路径（用于全量同步的快照）。
+  //  - 若清理失败仅记录警告，不阻塞启动（尽力而为）。
   auto s = rocksdb::DestroyDB(srv_->GetConfig()->sync_checkpoint_dir, rocksdb::Options());
   if (!s.ok()) {
     warn("Can't clean synced checkpoint from master, error: {}", s.ToString());
@@ -352,8 +450,15 @@ Status ReplicationThread::Start(std::function<bool()> &&pre_fullsync_cb, std::fu
   }
 
   // cleanup the old backups, so we can start replication in a clean state
+  //
+  // 3. 清空所有旧的备份文件（通常为过期的 RDB 或 SST 文件），释放磁盘空间，为新的复制过程腾出空间。
+  // 参数说明：(0, 0) 表示无条件删除所有备份（无保留策略）。
   storage_->PurgeOldBackups(0, 0);
 
+  // 4. 创建并启动复制线程
+  // - 创建名为 "master-repl" 的线程（便于调试和监控）。
+  // - 线程执行的是当前对象的 run() 方法，它是主从复制状态机的核心逻辑入口，其内部是状态机驱动的复制流程。
+  // - assert(stop_flag_)：确保线程退出时 stop_flag_ 已置位（正常停止）。
   t_ = GET_OR_RET(util::CreateThread("master-repl", [this] {
     this->run();
     assert(stop_flag_);
@@ -427,11 +532,46 @@ ReplicationThread::CBState ReplicationThread::checkDBNameWriteCB(bufferevent *be
   return CBState::NEXT;
 }
 
+// 校验主从节点的数据库名称是否匹配，确保主从节点操作的是同一逻辑数据库，避免数据意外覆盖。
+//
+// Q: 这个校验由谁发起？
+// A: 由从节点主动发出 REPLCONF db-name <local_name> 命令，告知主节点当前 db ，主节点回一个简单字符串作为回应（即主节点当前 DB 名）。
+//    之后从节点就进入 checkDBNameReadCB() 来解析并比对。
+//
+// 从节点 (Replica)                             主节点 (Master)
+//     |                                            |
+//     | ------ TCP connect ----------------------> |   ← 建立连接
+//     |                                            |
+//     | --- REPLCONF listening-port ip-address --->|   ← 告知自己网络信息
+//     |                                            |
+//     | <------------------ +OK -------------------|   ← 主节点响应，返回 OK 或者 Err
+//     |                                            |
+//     | -------- REPLCONF db-name ---------------->|   ← 告知自己使用的 db 名
+//     |                                            |
+//     | <------ <db-name string> ----------------- |   ← 主节点响应，返回自身 db 名
+//     |                                            |
+//     | [checkDBNameReadCB]                        |   ← 本地比对 db name 是否一致
+//     |                                            |
+//     | ---- PSYNC <replid> <offset> ------------> |   ← 尝试增量同步
+//     |                                            |
+//     | <-- +CONTINUE / +FULLRESYNC <id> <off> --- |   ← 主节点根据情况返回响应
+//     |                                            |
+//     |      （分支判断）                            |
+//     |        ├─ +CONTINUE                        |   ← 增量同步成功，进入 backlog 模式
+//     |        └─ +FULLRESYNC                      |   ← 启动全量同步（RDB + backlog）
+//     |                                            |
+//     | [开始同步数据]                               |
+//     |                                            |
 ReplicationThread::CBState ReplicationThread::checkDBNameReadCB(bufferevent *bev) {
+  // 1. 从主节点读取一行响应
   auto input = bufferevent_get_input(bev);
   UniqueEvbufReadln line(input, EVBUFFER_EOL_CRLF_STRICT);
-  if (!line) return CBState::AGAIN;
+  if (!line) return CBState::AGAIN;  // 数据不完整，继续等待
 
+  // 2. 错误处理
+  // Redis 协议中以 - 开头的表示错误回复。
+  // 如果主节点回复错误，说明主节点正在恢复数据（RDB 加载中）；或者发生其他错误；
+  // 统一返回 CBState::RESTART，意味着复制流程需要重新开始。
   if (line[0] == '-') {
     if (isRestoringError(line.View())) {
       warn("The master was restoring the db, retry later");
@@ -440,56 +580,114 @@ ReplicationThread::CBState ReplicationThread::checkDBNameReadCB(bufferevent *bev
     }
     return CBState::RESTART;
   }
+
+  // 3. 校验数据库名是否一致
+  // 从本地存储中获取当前 DB 名称。
+  // 比较主节点发来的 DB 名（line.get()）是否与本地一致。
+  // 如果一致，返回 CBState::NEXT，复制状态机继续执行下一步（通常是尝试 PSYNC 同步）。
   std::string db_name = storage_->GetName();
   if (line.length == db_name.size() && !strncmp(line.get(), db_name.data(), line.length)) {
     // DB name match, we should continue to next step: TryPsync
     info("[replication] DB name is valid, continue...");
     return CBState::NEXT;
   }
+
+  // 如果不一致，复制流程必须终止并重新尝试
   error("[replication] Mismatched the db name, local: {}, remote: {}", db_name, line.get());
   return CBState::RESTART;
 }
 
+// 构造并发送 REPLCONF 命令 到主节点，用于在 Redis/Kvrocks 主从复制的握手阶段传递从节点的配置信息。
 ReplicationThread::CBState ReplicationThread::replConfWriteCB(bufferevent *bev) {
+  // 1. 获取从节点配置
   auto config = srv_->GetConfig();
-
+  // 读取从节点的服务端口，优先使用 replica_announce_port（若显式配置），否则使用默认 port。
+  // 例如：若从节点运行在 6380 但通过 replica-announce-port 6381 暴露，则告知主节点端口为 6381（适用于 NAT 映射场景）。
   auto port = config->replica_announce_port > 0 ? config->replica_announce_port : config->port;
+  // 2. 构造 REPLCONF 命令
+  //  命令参数：
+  //    - 必选参数：listening-port <port>（从节点的服务端口）。
+  //    - 可选参数：ip-address <ip>（从节点的 IP 地址）。
   std::vector<std::string> data_to_send{"replconf", "listening-port", std::to_string(port)};
   if (!next_try_without_announce_ip_address_ && !config->replica_announce_ip.empty()) {
+    // 若主节点支持 ip-address 参数且配置了 replica-announce-ip ，发送 ip-address 配置项
     data_to_send.emplace_back("ip-address");
     data_to_send.emplace_back(config->replica_announce_ip);
   }
+  // 3. 发送命令
   SendString(bev, redis::ArrayOfBulkStrings(data_to_send));
+  // 4. 更新状态：将复制状态标记为 kReplReplConf 表示正在等待 REPLCONF 响应。
   repl_state_.store(kReplReplConf, std::memory_order_relaxed);
   info("[replication] replconf request was sent, waiting for response");
   return CBState::NEXT;
 }
 
+// REPLCONF 是 Redis（以及兼容系统如 Kvrocks）主从复制中的一个辅助命令，用于从节点向主节点报告自身信息或设置某些复制参数。
+// REPLCONF 不涉及数据同步本身，而是为主从同步提供环境配置或状态反馈。
+//
+// REPLCONF 作用：
+// (1) 从节点信息上报
+// 从节点通过 REPLCONF 向主节点传递关键信息，例如：
+//  - 监听端口：REPLCONF listening-port <port> ，告诉主节点自己的服务端口（用于主节点执行 CLIENT LIST 或故障转移时连接）。
+//  - IP 地址：REPLCONF ip-address <ip> ，用于主节点识别从节点来源（尤其在 NAT 网络环境中）。
+//  - CAPA 能力：REPLCONF capa <capability> ，表示支持新协议（如 eof 表示支持无盘复制）。
+// (2) 复制流控与健康检查
+//  - ACK 偏移量：REPLCONF ACK <offset> ，从节点定期向主节点确认已接收的数据偏移量（用于增量同步和超时检测），主节点根据这个信息判断是否可以进行 PSYNC 增量复制。
+//  - 保活机制：无数据传输时，REPLCONF 可作为心跳包维持连接，若从节点长时间未 ACK ，主节点可能断开连接以触发重同步。
+// (3) 主节点反馈
+//  主节点可能响应：
+//    - +OK：成功接收配置。
+//    - -ERR：参数错误或版本不支持。
+//
+// REPLCONF 在复制流程中的位置
+//   从节点连接主节点
+//         ↓
+//   主节点回复 PING
+//         ↓
+//   从节点发送 REPLCONF （监听信息、ACK等）
+//         ↓
+//   从节点发送 PSYNC（请求同步）
+//         ↓
+//   主节点决定是增量同步（+CONTINUE）还是全量同步（+FULLRESYNC）
+//
 ReplicationThread::CBState ReplicationThread::replConfReadCB(bufferevent *bev) {
+  // 从 socket 缓冲区读取一行响应（以 \r\n 结尾）
   auto input = bufferevent_get_input(bev);
   UniqueEvbufReadln line(input, EVBUFFER_EOL_CRLF_STRICT);
-  if (!line) return CBState::AGAIN;
+  if (!line) return CBState::AGAIN; // 数据不完整，继续等待
 
   // on unknown option: first try without announce ip, if it fails again - do nothing (to prevent infinite loop)
+  // 主节点返回 "unknown option" 错误，可能主节点是旧版本，不支持 REPLCONF 的某些参数（如 ip-address），需要尝试兼容处理。
   if (isUnknownOption(line.View()) && !next_try_without_announce_ip_address_) {
-    next_try_without_announce_ip_address_ = true;
+    next_try_without_announce_ip_address_ = true;  // 设置标志位 next_try_without_announce_ip_address_，下次尝试省略不支持的参数。
     warn("The old version master, can't handle ip-address, try without it again");
     // Retry previous state, i.e. send replconf again
-    return CBState::PREV;
+    return CBState::PREV; // 返回 PREV 回退到上一步，让状态机重发 REPLCONF（不带IP）。
   }
+
+  // 主节点正在恢复中（如加载 RDB）
   if (line[0] == '-' && isRestoringError(line.View())) {
     warn("The master was restoring the db, retry later");
-    return CBState::RESTART;
+    return CBState::RESTART; // 返回 CBState::RESTART，稍后重试。
   }
+
+  // 如果不是 +OK 响应，而是其他错误（但不是上述特殊错误）：
+  //  - 记录 warning 日志。
+  //  - 直接 return NEXT，表示 “跳过 REPLCONF，继续下一阶段（PSYNC）”。
+  // 合理性在于：一些老版本主节点甚至完全不支持 REPLCONF，但仍可进行复制。
   if (!ResponseLineIsOK(line.View())) {
     warn("[replication] Failed to replconf: {}", line.get() + 1);
     //  backward compatible with old version that doesn't support replconf cmd
     return CBState::NEXT;
   } else {
+    // 主节点返回 +OK，表示 REPLCONF 成功。
+    // 进入复制流程的下一步（发送 PSYNC 命令）。
     info("[replication] replconf is ok, start psync");
     return CBState::NEXT;
   }
 }
+
+
 
 // 首次全量同步
 //
@@ -591,11 +789,11 @@ ReplicationThread::CBState ReplicationThread::tryPSyncWriteCB(bufferevent *bev) 
 
   // Get replication id
   // 2. 获取复制 ID
-  std::string replid_in_wal = storage_->GetReplIdFromWalBySeq(cur_seq);
+  std::string replid_in_wal = storage_->GetReplIdFromWalBySeq(cur_seq); // 从 WAL 中获取复制 ID
   // Set if valid replication id
-  if (replid_in_wal.length() == kReplIdLength) {    // 优先使用WAL中的复制ID(如果有效)
+  if (replid_in_wal.length() == kReplIdLength) {    // 如果 WAL 中的复制 ID 有效
     replid = replid_in_wal;
-  } else {  // WAL中没有有效ID时，尝试从数据库引擎获取
+  } else {  // WAL 中没有有效 ID 时，尝试从数据库引擎获取
     // Maybe there is no WAL, we can get replication id from db since master
     // always write replication id into db before any operation when starting
     // new "replication history".
@@ -609,16 +807,16 @@ ReplicationThread::CBState ReplicationThread::tryPSyncWriteCB(bufferevent *bev) 
   // Also use old PSYNC if replica can't find replication id from WAL and DB.
   //
   // 3. 决定使用哪种 PSYNC 协议版本
-  if (!srv_->GetConfig()->use_rsid_psync || // 强制使用旧版
-      next_try_old_psync_ ||                // 上次主节点返回了“不支持新版 PSYNC”的错误
+  if (!srv_->GetConfig()->use_rsid_psync || // 配置强制使用旧版
+      next_try_old_psync_ ||                // 上次主节点返回了 "不支持新版 PSYNC" 的错误
       replid.length() != kReplIdLength) {   // 无法获得合法长度的 replid
     next_try_old_psync_ = false;  // Reset next_try_old_psync_
-    // 发送旧版PSYNC命令(仅包含序列号)
+    // 发送旧版 PSYNC 命令给 master (仅包含序列号)
     SendString(bev, redis::ArrayOfBulkStrings({"PSYNC", std::to_string(next_seq)}));
     info("[replication] Try to use psync, next seq: {}", next_seq);
   } else {
     // NEW PSYNC "Unique Replication Sequence ID": replication id and sequence id
-    // 发送新版PSYNC命令(包含复制ID+序列号)
+    // 发送新版 PSYNC 命令给 master (包含复制 ID +序列号)
     SendString(bev, redis::ArrayOfBulkStrings({"PSYNC", replid, std::to_string(next_seq)}));
     info("[replication] Try to use new psync, current unique replication sequence id: {}:{}", replid, cur_seq);
   }
