@@ -38,6 +38,15 @@
 #include "storage/redis_db.h"
 #include "unique_fd.h"
 
+
+// 迁移类型：
+//  - kRedisCommand（默认）: 通过生成类似 SET, HSET, ZADD 这类 Redis 命令，把已有的数据和日志转换成命令并在目标节点上重放。
+//    优点：通用，目标节点不需要与源节点版本一致。
+//    缺点：效率低，数据需要逐条处理和发送。
+//  - kRawKeyValue : 使用 APPLYBATCH 命令，直接传输 RocksDB 的 key-value 数据（包括元数据和实际 value）。
+//    优点：更快且节省网络开销。
+//    缺点：如果目标节点不支持 APPLYBATCH（如版本不兼容），会自动退回到 kRedisCommand 模式。
+
 enum class MigrationType {
   /// Use Redis commands to migrate data.
   /// It will try to extract commands from existing data and log, then replay
@@ -50,14 +59,35 @@ enum class MigrationType {
   kRawKeyValue
 };
 
+// 迁移状态：
+//  - kNone: 没有任务或任务尚未开始。
+//  - kStarted: 正在进行 slot 迁移。
+//  - kSuccess: 全部 key 成功迁移完成。
+//  - kFailed: 中途发生错误（如网络中断、目标拒绝写入等），导致迁移失败。
 enum class MigrationState { kNone = 0, kStarted, kSuccess, kFailed };
 
+// 迁移阶段：
+//  - kNone: 尚未开始。
+//  - kStart: 正在准备迁移，初始化阶段。
+//  - kSnapshot: 正在拷贝数据快照（类似 RDB 快照），这是 bulk 的 key-value 数据。
+//  - kWAL: 拷贝快照后，再同步未被快照捕捉的 WAL 日志（类似 PSYNC 的增量补全）。
+//  - kSuccess: 所有数据成功同步，目标节点已准备接管。
+//  - kFailed: 发生错误，迁移失败。
+//  - kClean: 清理阶段，比如释放迁移状态、关闭连接等。
 enum class SlotMigrationStage { kNone, kStart, kSnapshot, kWAL, kSuccess, kFailed, kClean };
 
+// key 的迁移结果：
+//  - kMigrated: 成功迁移到了目标节点。
+//  - kExpired: 在迁移前已经过期，不需处理。
+//  - kUnderlyingStructEmpty: 比如一个 set/hash/zset 全部元素都已过期或删除，结构本身也可被跳过。
 enum class KeyMigrationResult { kMigrated, kExpired, kUnderlyingStructEmpty };
 
 struct SlotMigrationJob {
-  SlotMigrationJob(const SlotRange &slot_range_in, std::string dst_ip, int dst_port, int speed, int pipeline_size,
+  SlotMigrationJob(const SlotRange &slot_range_in,
+                   std::string dst_ip,
+                   int dst_port,
+                   int speed,
+                   int pipeline_size,
                    int seq_gap)
       : slot_range(slot_range_in),
         dst_ip(std::move(dst_ip)),

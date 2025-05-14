@@ -343,6 +343,14 @@ class CommandFetchMeta : public Commander {
   }
 };
 
+
+
+// Q: 为什么 PSync 需要 Detach ，而这里不需要？
+// A:
+//  是否需要 conn->Detach()，关键在于子线程是否绕过了 bufferevent、直接使用了 socket。
+//    - 直接用 socket（阻塞 IO） → 一定要 Detach()，否则容易 race 。
+//    - 继续用 bufferevent（线程安全） → 可以不 Detach()，但要用 NeedNotFreeBufferEvent() 防止主线程释放。
+//
 class CommandFetchFile : public Commander {
  public:
   Status Parse(const std::vector<std::string> &args) override {
@@ -397,8 +405,7 @@ class CommandFetchFile : public Commander {
         auto end = std::chrono::high_resolution_clock::now();
         uint64_t duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
         if (max_replication_bytes > 0) {
-          auto shortest = static_cast<uint64_t>(static_cast<double>(file_size) /
-                                                static_cast<double>(max_replication_bytes) * (1000 * 1000));
+          auto shortest = static_cast<uint64_t>(static_cast<double>(file_size) / static_cast<double>(max_replication_bytes) * (1000 * 1000));
           if (duration < shortest) {
             info("[replication] Need to sleep {} ms since of sending files too quickly", (shortest - duration) / 1000);
             usleep(shortest - duration);
@@ -424,16 +431,15 @@ class CommandFetchFile : public Commander {
 class CommandDBName : public Commander {
  public:
   Status Parse([[maybe_unused]] const std::vector<std::string> &args) override { return Status::OK(); }
-
-  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn,
-                 [[maybe_unused]] std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn, [[maybe_unused]] std::string *output) override {
     conn->Reply(srv->storage->GetName() + CRLF);
     return Status::OK();
   }
 };
 
 
-REDIS_REGISTER_COMMANDS(Replication, MakeCmdAttr<CommandReplConf>("replconf", -3, "read-only no-script", NO_KEY),
+REDIS_REGISTER_COMMANDS(Replication,
+                        MakeCmdAttr<CommandReplConf>("replconf", -3, "read-only no-script", NO_KEY),
                         MakeCmdAttr<CommandPSync>("psync", -2, "read-only no-multi no-script", NO_KEY),
                         MakeCmdAttr<CommandFetchMeta>("_fetch_meta", 1, "read-only no-multi no-script", NO_KEY),
                         MakeCmdAttr<CommandFetchFile>("_fetch_file", 2, "read-only no-multi no-script", NO_KEY),

@@ -41,8 +41,14 @@ constexpr std::string_view errFailedToSetImportStatus = "failed to set import st
 constexpr std::string_view errUnsupportedMigrationType = "unsupported migration type";
 
 static std::map<RedisType, std::string> type_to_cmd = {
-    {kRedisString, "set"}, {kRedisList, "rpush"},    {kRedisHash, "hmset"},      {kRedisSet, "sadd"},
-    {kRedisZSet, "zadd"},  {kRedisBitmap, "setbit"}, {kRedisSortedint, "siadd"}, {kRedisStream, "xadd"},
+    {kRedisString, "set"},
+    {kRedisList, "rpush"},
+    {kRedisHash, "hmset"},
+    {kRedisSet, "sadd"},
+    {kRedisZSet, "zadd"},
+    {kRedisBitmap, "setbit"},
+    {kRedisSortedint, "siadd"},
+    {kRedisStream, "xadd"},
 };
 
 SlotMigrator::SlotMigrator(Server *srv)
@@ -75,8 +81,11 @@ SlotMigrator::SlotMigrator(Server *srv)
   }
 }
 
-Status SlotMigrator::PerformSlotRangeMigration(const std::string &node_id, std::string &dst_ip, int dst_port,
-                                               const SlotRange &slot_range, SyncMigrateContext *blocking_ctx) {
+Status SlotMigrator::PerformSlotRangeMigration(const std::string &node_id,
+                                               std::string &dst_ip,
+                                               int dst_port,
+                                               const SlotRange &slot_range,
+                                               SyncMigrateContext *blocking_ctx) {
   // TODO: concurrent migration, multiple migration jobs
   // Only one slot migration job at the same time
   SlotRange empty_slot_range = {-1, -1};
@@ -159,8 +168,11 @@ void SlotMigrator::loop() {
       return;
     }
     info("[migrate] Migrating slot(s): {}, dst_ip: {}, dst_port: {}, max_speed: {}, max_pipeline_size: {}",
-         migration_job_->slot_range.String(), migration_job_->dst_ip, migration_job_->dst_port,
-         migration_job_->max_speed, migration_job_->max_pipeline_size);
+         migration_job_->slot_range.String(),
+         migration_job_->dst_ip,
+         migration_job_->dst_port,
+         migration_job_->max_speed,
+         migration_job_->max_pipeline_size);
 
     dst_ip_ = migration_job_->dst_ip;
     dst_port_ = migration_job_->dst_port;
@@ -226,8 +238,7 @@ void SlotMigrator::runMigrationProcess() {
           migration_state_ = MigrationState::kSuccess;
           resumeSyncCtx(s);
         } else {
-          error("[migrate] Failed to finish a successful migration of slot(s) {}. Error: {}",
-                slot_range_.load().String(), s.Msg());
+          error("[migrate] Failed to finish a successful migration of slot(s) {}. Error: {}",slot_range_.load().String(), s.Msg());
           current_stage_ = SlotMigrationStage::kFailed;
           resumeSyncCtx(s);
         }
@@ -236,8 +247,7 @@ void SlotMigrator::runMigrationProcess() {
       case SlotMigrationStage::kFailed: {
         auto s = finishFailedMigration();
         if (!s.IsOK()) {
-          error("[migrate] Failed to finish a failed migration of slot(s) {}. Error: {}", slot_range_.load().String(),
-                s.Msg());
+          error("[migrate] Failed to finish a failed migration of slot(s) {}. Error: {}", slot_range_.load().String(),s.Msg());
         }
         info("[migrate] Failed to migrate a slot(s) {}", slot_range_.load().String());
         migration_state_ = MigrationState::kFailed;
@@ -396,10 +406,7 @@ Status SlotMigrator::sendSnapshotByCmd() {
   if (!s.IsOK()) {
     return s.Prefixed(errFailedToSendCommands);
   }
-  info(
-      "[migrate] Succeed to migrate slot(s) snapshot, slot(s): {}, Migrated keys: {}, Expired keys: {}, Empty keys: {}",
-      slot_range.String(), migrated_key_cnt, expired_key_cnt, empty_key_cnt);
-
+  info("[migrate] Succeed to migrate slot(s) snapshot, slot(s): {}, Migrated keys: {}, Expired keys: {}, Empty keys: {}",slot_range.String(), migrated_key_cnt, expired_key_cnt, empty_key_cnt);
   return Status::OK();
 }
 
