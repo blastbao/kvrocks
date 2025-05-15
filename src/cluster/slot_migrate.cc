@@ -377,34 +377,39 @@ Status SlotMigrator::sendSnapshotByCmd() {
   info("[migrate] Iterate keys of slot(s), key's prefix: {}", prefix);
   std::string upper_bound = ComposeSlotKeyUpperBound(namespace_, slot_range.end);
 
-  // 构造迭代器选型
-  rocksdb::ReadOptions read_options = storage_->DefaultScanOptions();
-  read_options.snapshot = slot_snapshot_;
+  // 设置迭代器快照、读取范围
+  rocksdb::ReadOptions read_options = storage_->DefaultScanOptions(); // 获取默认的扫描配置（包含缓存策略等设置）
+  read_options.snapshot = slot_snapshot_;                             // 快照绑定
   Slice prefix_slice(prefix);
   Slice upper_bound_slice(upper_bound);
-  read_options.iterate_lower_bound = &prefix_slice;
-  read_options.iterate_upper_bound = &upper_bound_slice;
+  read_options.iterate_lower_bound = &prefix_slice;                   // 槽范围起始键
+  read_options.iterate_upper_bound = &upper_bound_slice;              // 槽范围结束键
 
-
+  // 创建迭代器
   rocksdb::ColumnFamilyHandle *cf_handle = storage_->GetCFHandle(ColumnFamilyID::Metadata);
   auto iter = util::UniqueIterator(storage_->GetDB()->NewIterator(read_options, cf_handle));
 
   // Seek to the beginning of keys start with 'prefix' and iterate all these keys
+  // 从 prefix 开始遍历，每次调用 .Next() 访问下一个 key，遇到 key 不属于本 slot 时就退出（提前终止）。
   int current_slot = slot_range.start;
   for (iter->Seek(prefix); iter->Valid(); iter->Next()) {
     // The migrating task has to be stopped, if server role is changed from master to slave
     // or flush command (flushdb or flushall) is executed
+    // 迁移任务被中止时停止遍历，比如角色变更或者执行了 flushdb/flushall 等命令
     if (stop_migration_) {
       return {Status::NotOK, std::string(errMigrationTaskCanceled)};
     }
 
     // Iteration is out of range
+    // 判断 key 是否属于当前 slot
+    // 备注：虽然已经用 iterate bound 来限定范围，但依然保险地做一次验证；
     current_slot = ExtractSlotId(iter->key());
     if (!slot_range.Contains(current_slot)) {
       break;
     }
 
     // Get user key
+    // 提取用户原始 key
     auto [_, user_key] = ExtractNamespaceKey(iter->key(), /*slot_id_encoded=*/true);
 
     // Add key's constructed commands to restore_cmds, send pipeline or not according to task's max_pipeline_size
@@ -708,9 +713,12 @@ Status SlotMigrator::checkMultipleResponses(int sock_fd, int total) {
   }
 }
 
+// 将一个 Key 从当前实例迁移到目标节点
 StatusOr<KeyMigrationResult> SlotMigrator::migrateOneKey(const rocksdb::Slice &key,
                                                          const rocksdb::Slice &encoded_metadata,
                                                          std::string *restore_cmds) {
+
+  // 将 RocksDB 中的 value 解码为一个 Metadata 对象，得到 key 的类型、大小、过期时间等信息。
   std::string bytes = encoded_metadata.ToString();
   Metadata metadata(kRedisNone, false);
   if (auto s = metadata.Decode(bytes); !s.ok()) {

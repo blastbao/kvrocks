@@ -39,22 +39,50 @@ static std::atomic<uint64_t> version_counter_ = 0;
 
 constexpr const char *kErrMetadataTooShort = "metadata is too short";
 
+// 数据结构：
+//  [namespace_len][namespace][slot_id?][key_len][key][version][sub_key]
+// 字段说明：
+//  | -------------- | -------------------| ---------------------------------------------- |
+//  | 字段            | 类型 / 长度        | 说明                                             |
+//  | -------------- | ----------------- | ----------------------------------------------- |
+//  | namespace_len  | 1 byte            | 命名空间长度（支持多租户）                           |
+//  | namespace      | 可变长（<256）      | 命名空间数据                                      |
+//  | slot_id        | 2 bytes (可选)     | Redis Cluster 的槽位，用于分片                     |
+//  | key_len        | 4 bytes            | 主键长度                                         |
+//  | key            | 可变长              | 主键，比如 `"user:123"`                          |
+//  | version        | 8 bytes            | 版本号，用于支持过期、事务等                        |
+//  | sub\_key       | 可变长（可选）       | 子键，比如 hash field、list index、zset member 等 |
+//  | -------------- | -------------------| ---------------------------------------------- |
+//
+//
+
+// 从一个编码后的字符串 input 中反解析出一个 InternalKey 对象。
 InternalKey::InternalKey(Slice input, bool slot_id_encoded) : slot_id_encoded_(slot_id_encoded) {
-  uint32_t key_size = 0;
+  // 取出 1 字节的 namespace_size
   uint8_t namespace_size = 0;
   GetFixed8(&input, &namespace_size);
+  // 取出 namespace_size 字节的 namespace_
   namespace_ = Slice(input.data(), namespace_size);
   input.remove_prefix(namespace_size);
+  // 如果启用了 slot_id_encoded_，读取 2 字节的 slot_id
   if (slot_id_encoded_) {
     GetFixed16(&input, &slotid_);
   }
+
+  // 读取 4 字节的 key 长度
+  uint32_t key_size = 0;
   GetFixed32(&input, &key_size);
+  // 读取 key_
   key_ = Slice(input.data(), key_size);
   input.remove_prefix(key_size);
+
+  // 读取 8 字节的版本号
   GetFixed64(&input, &version_);
+  // 读取剩下的字节作为 sub_key_
   sub_key_ = Slice(input.data(), input.size());
 }
 
+// 构造 InternalKey
 InternalKey::InternalKey(Slice ns_key, Slice sub_key, uint64_t version, bool slot_id_encoded)
     : sub_key_(sub_key), version_(version), slot_id_encoded_(slot_id_encoded) {
   uint8_t namespace_size = 0;
@@ -75,6 +103,7 @@ Slice InternalKey::GetSubKey() const { return sub_key_; }
 
 uint64_t InternalKey::GetVersion() const { return version_; }
 
+// 将一个 InternalKey 对象编码为字符串
 std::string InternalKey::Encode() const {
   std::string out;
   size_t total = 1 + namespace_.size() + 4 + key_.size() + 8 + sub_key_.size();
@@ -95,6 +124,7 @@ std::string InternalKey::Encode() const {
   return out;
 }
 
+// 判断两个 InternalKey 是否相等，比较 namespace、key、sub_key、version。
 bool InternalKey::operator==(const InternalKey &that) const {
   if (namespace_ != this->namespace_) return false;
   if (key_ != that.key_) return false;
@@ -113,6 +143,7 @@ uint16_t ExtractSlotId(Slice ns_key) {
   return slot_id;
 }
 
+// 提取出 <namespace, key>
 template <typename T>
 std::tuple<T, T> ExtractNamespaceKey(Slice ns_key, bool slot_id_encoded) {
   uint8_t namespace_size = 0;

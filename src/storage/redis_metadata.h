@@ -131,12 +131,12 @@ class InternalKey {
   bool operator==(const InternalKey &that) const;
 
  private:
-  Slice namespace_;
-  Slice key_;
-  Slice sub_key_;
-  uint64_t version_;
-  uint16_t slotid_;
-  bool slot_id_encoded_;
+  Slice namespace_;       // 命名空间
+  Slice key_;             // 主键
+  Slice sub_key_;         // 子键
+  uint64_t version_;      // 版本号（52bit 微秒 + 11bit 自增）
+  uint16_t slotid_;       // 分片ID，仅在开启 slot_id_encoded_ 时生效
+  bool slot_id_encoded_;  // 是否启用了 slot id 编码
 };
 
 constexpr uint8_t METADATA_64BIT_ENCODING_MASK = 0x80;
