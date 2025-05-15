@@ -81,41 +81,48 @@ SlotMigrator::SlotMigrator(Server *srv)
   }
 }
 
-Status SlotMigrator::PerformSlotRangeMigration(const std::string &node_id,
-                                               std::string &dst_ip,
-                                               int dst_port,
-                                               const SlotRange &slot_range,
-                                               SyncMigrateContext *blocking_ctx) {
+// 在当前节点启动一个 slot 迁移任务，并将其委托给后台迁移线程异步执行
+Status SlotMigrator::PerformSlotRangeMigration(const std::string &node_id,      // 目标节点 ID
+                                               std::string &dst_ip,             // 目标节点 IP
+                                               int dst_port,                    // 目标节点 PORT
+                                               const SlotRange &slot_range,     // 迁移 slot range
+                                               SyncMigrateContext *blocking_ctx // （可选）阻塞上下文，用于阻塞调用线程直到迁移完成（如用于同步命令）
+                                               ) {
   // TODO: concurrent migration, multiple migration jobs
   // Only one slot migration job at the same time
+  // 确保同一时间只会有一个迁移任务在执行
+  //  - 使用原子操作检查当前 slot_range_ 是否为空，若为空则赋值为入参 slot_range ，否则 slot_range_ 非空意味着当前有任务在进行，直接返回错误。
   SlotRange empty_slot_range = {-1, -1};
   if (!slot_range_.compare_exchange_strong(empty_slot_range, slot_range)) {
     return {Status::NotOK, "There is already a migrating job"};
   }
 
+  // forbidden_slot_range_ 存储着禁止迁移的槽位段（一般是已经迁移完成的或者故障恢复时保护的）。
+  // 如果新任务的 slot_range 与 forbidden_slot_range_ 有交集，则说明 slot_range 包含不可迁移的槽位，重置 slot_range_ 并报错返回。
   if (slot_range.HasOverlap(forbidden_slot_range_)) {
     // Have to release migrate slot set above
     slot_range_ = empty_slot_range;
     return {Status::NotOK, "Can't migrate slot which has been migrated"};
   }
+
+  // 更新迁移状态
   migration_state_ = MigrationState::kStarted;
 
+  // 获取迁移配置
   auto speed = srv_->GetConfig()->migrate_speed;
   auto seq_gap = srv_->GetConfig()->sequence_gap;
   auto pipeline_size = srv_->GetConfig()->pipeline_size;
-
   if (speed <= 0) {
     speed = 0;
   }
-
   if (pipeline_size <= 0) {
     pipeline_size = kDefaultMaxPipelineSize;
   }
-
   if (seq_gap <= 0) {
     seq_gap = kDefaultSequenceGapLimit;
   }
 
+  // ???
   if (blocking_ctx) {
     std::unique_lock<std::mutex> lock(blocking_mutex_);
     blocking_context_ = blocking_ctx;
@@ -125,6 +132,9 @@ Status SlotMigrator::PerformSlotRangeMigration(const std::string &node_id,
   dst_node_ = node_id;
 
   // Create migration job
+  //
+  // 创建一个 SlotMigrationJob，其封装了迁移所需的参数；
+  // 将 SlotMigrationJob 存入 migration_job_ ，通过条件变量 job_cv_ 通知后台线程立即开始执行迁移。
   auto job = std::make_unique<SlotMigrationJob>(slot_range, dst_ip, dst_port, speed, pipeline_size, seq_gap);
   {
     std::lock_guard<std::mutex> guard(job_mutex_);
@@ -185,8 +195,9 @@ void SlotMigrator::loop() {
 }
 
 void SlotMigrator::runMigrationProcess() {
+  // 迁移开始
   current_stage_ = SlotMigrationStage::kStart;
-
+  // 不断循环直到线程终止
   while (true) {
     if (isTerminated()) {
       warn("[migrate] Will stop state machine, because the thread was terminated");
@@ -194,6 +205,7 @@ void SlotMigrator::runMigrationProcess() {
       return;
     }
 
+    // 执行不同阶段的迁移逻辑
     switch (current_stage_) {
       case SlotMigrationStage::kStart: {
         auto s = startMigration();
@@ -268,42 +280,53 @@ void SlotMigrator::runMigrationProcess() {
 
 Status SlotMigrator::startMigration() {
   // Get snapshot and sequence
+  // 1. 获取 RocksDB Snapshot
   slot_snapshot_ = storage_->GetDB()->GetSnapshot();
   if (!slot_snapshot_) {
     return {Status::NotOK, "failed to create snapshot"};
   }
 
+  // 2. 记录当前快照的 WAL 序列号，用于后续增量同步
   wal_begin_seq_ = slot_snapshot_->GetSequenceNumber();
   last_send_time_ = 0;
 
+
   // Connect to the destination node
+  // 3. 创建到目标节点的 TCP 连接
   auto result = util::SockConnect(dst_ip_, dst_port_);
   if (!result.IsOK()) {
     return {Status::NotOK, fmt::format("failed to connect to the destination node: {}", result.Msg())};
   }
-
   dst_fd_.Reset(*result);
 
   // Auth first
+  // 4. 如果配置文件中开启密码认证（requirepass），则对目标 Redis 节点进行 AUTH；
   std::string pass = srv_->GetConfig()->requirepass;
   if (!pass.empty()) {
     auto s = authOnDstNode(*dst_fd_, pass);
-    if (!s.IsOK()) {
+    if (!s.IsOK()) { // 检查错误码
       return s.Prefixed("failed to authenticate on destination node");
     }
   }
 
   // Set destination node import status to START
+  // 5. 向目标节点发送 IMPORT START 命令，通知目标开始接收迁移数据；若目标报错，则停止迁移。
   auto s = setImportStatusOnDstNode(*dst_fd_, kImportStart);
   if (!s.IsOK()) {
     return s.Prefixed(errFailedToSetImportStatus);
   }
 
+  // 6. 读取配置中指定的迁移类型：
+  //  - kRawKeyValue: 使用 Kvrocks 自定义的 APPLYBATCH 命令，批量写入底层 RocksDB；
+  //  - kRedisCommand: 使用标准 Redis 命令（如 SET, RPUSH 等）逐条迁移。
   migration_type_ = srv_->GetConfig()->migrate_type;
 
   // If the APPLYBATCH command is not supported on the destination,
   // we will fall back to the redis-command migration type.
   if (migration_type_ == MigrationType::kRawKeyValue) {
+    // 检查目标节点是否支持 APPLYBATCH
+    //  - 如果当前使用的是 RawKeyValue 模式，则尝试检测目标是否支持 APPLYBATCH 命令；
+    //  -如果目标版本不支持（比如是普通 Redis 实例），则自动降级为 RedisCommand 模式；
     bool supported = GET_OR_RET(supportedApplyBatchCommandOnDstNode(*dst_fd_));
     if (!supported) {
       info("APPLYBATCH command is not supported, use redis command for migration");
@@ -333,7 +356,12 @@ Status SlotMigrator::syncWAL() {
   return {Status::NotOK, std::string(errUnsupportedMigrationType)};
 }
 
+// 将某个 slot 区间内的 key 以 Redis 命令格式迁移到目标节点。
 Status SlotMigrator::sendSnapshotByCmd() {
+  // 变量初始化
+  //  - 记录三种 key 类型的数量；
+  //  - restore_cmds 存放待发送的 Redis 命令拼接；
+  //  - 复制一个 slot_range_ 用于遍历。
   uint64_t migrated_key_cnt = 0;
   uint64_t expired_key_cnt = 0;
   uint64_t empty_key_cnt = 0;
@@ -342,16 +370,22 @@ Status SlotMigrator::sendSnapshotByCmd() {
   info("[migrate] Start migrating snapshot of slot(s): {}", slot_range.String());
 
   // Construct key prefix to iterate the keys belong to the target slot
+  //
+  // Kvrocks 的所有 key 以 {namespace}:{slot_id}|key 格式存储；
+  // 这里根据 slot 范围构造 RocksDB 的遍历上下界，确保只遍历当前 slot 区间的 key。
   std::string prefix = ComposeSlotKeyPrefix(namespace_, slot_range.start);
   info("[migrate] Iterate keys of slot(s), key's prefix: {}", prefix);
-
   std::string upper_bound = ComposeSlotKeyUpperBound(namespace_, slot_range.end);
+
+  // 构造迭代器选型
   rocksdb::ReadOptions read_options = storage_->DefaultScanOptions();
   read_options.snapshot = slot_snapshot_;
   Slice prefix_slice(prefix);
   Slice upper_bound_slice(upper_bound);
   read_options.iterate_lower_bound = &prefix_slice;
   read_options.iterate_upper_bound = &upper_bound_slice;
+
+
   rocksdb::ColumnFamilyHandle *cf_handle = storage_->GetCFHandle(ColumnFamilyID::Metadata);
   auto iter = util::UniqueIterator(storage_->GetDB()->NewIterator(read_options, cf_handle));
 

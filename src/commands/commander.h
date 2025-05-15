@@ -361,11 +361,23 @@ auto MakeCmdAttr(const std::string &name, int arity, const std::string &descript
 }
 
 template <typename T>
-auto MakeCmdAttr(const std::string &name, int arity, const std::string &description, int first_key, int last_key,
-                 int key_step = 1, const AdditionalFlagGen &flag_gen = {}) {
-  CommandAttributes attr(name, arity, CommandCategory::Unknown, ParseCommandFlags(description, name), flag_gen,
-                         {first_key, last_key, key_step},
-                         []() -> std::unique_ptr<Commander> { return std::unique_ptr<Commander>(new T()); });
+auto MakeCmdAttr(const std::string &name,
+                 int arity,
+                 const std::string &description,
+                 int first_key,
+                 int last_key,
+                 int key_step = 1,
+                 const AdditionalFlagGen &flag_gen = {}) {
+  CommandAttributes attr( name,
+                          arity,
+                          CommandCategory::Unknown,
+                          ParseCommandFlags(description, name),
+                          flag_gen,
+                          {first_key, last_key, key_step},
+                          []() -> std::unique_ptr<Commander> {
+                            return std::unique_ptr<Commander>(new T());
+                          }
+                        );
 
   return attr;
 }
