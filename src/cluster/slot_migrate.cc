@@ -122,7 +122,7 @@ Status SlotMigrator::PerformSlotRangeMigration(const std::string &node_id,      
     seq_gap = kDefaultSequenceGapLimit;
   }
 
-  // ???
+  // [重要] 如果开启了同步迁移，这里调用 blocking_ctx->Suspend() 挂起，调用者会阻塞在 blocking_ctx 上直到后台线程完成迁移并调用 blocking_ctx->Resume()
   if (blocking_ctx) {
     std::unique_lock<std::mutex> lock(blocking_mutex_);
     blocking_context_ = blocking_ctx;
@@ -143,6 +143,7 @@ Status SlotMigrator::PerformSlotRangeMigration(const std::string &node_id,      
   }
   info("[migrate] Start migrating slot(s) {} to {}:{}", slot_range.String(), dst_ip, dst_port);
 
+  // 这里创建线程完成后立即返回，如果是同步迁移客户端会通过 blocking_ctx 去阻塞等待；
   return Status::OK();
 }
 
@@ -205,9 +206,9 @@ void SlotMigrator::runMigrationProcess() {
       return;
     }
 
-    // 执行不同阶段的迁移逻辑
+    // 状态机流转
     switch (current_stage_) {
-      case SlotMigrationStage::kStart: {
+      case SlotMigrationStage::kStart: { // 初始化：创建快照、建立连接、迁移握手
         auto s = startMigration();
         if (s.IsOK()) {
           info("[migrate] Succeed to start migrating slot(s) {}", slot_range_.load().String());
@@ -219,7 +220,7 @@ void SlotMigrator::runMigrationProcess() {
         }
         break;
       }
-      case SlotMigrationStage::kSnapshot: {
+      case SlotMigrationStage::kSnapshot: { // 从快照中提取指定 slot_range_ 的 kv 发送给目标节点
         auto s = sendSnapshot();
         if (s.IsOK()) {
           current_stage_ = SlotMigrationStage::kWAL;
@@ -230,7 +231,7 @@ void SlotMigrator::runMigrationProcess() {
         }
         break;
       }
-      case SlotMigrationStage::kWAL: {
+      case SlotMigrationStage::kWAL: {  // 从 wal 提取 snapshot sequence number 到 latest sequence number 之前的新增数据发送目标节点
         auto s = syncWAL();
         if (s.IsOK()) {
           info("[migrate] Succeed to sync from WAL for slot(s) {}", slot_range_.load().String());
@@ -242,11 +243,11 @@ void SlotMigrator::runMigrationProcess() {
         }
         break;
       }
-      case SlotMigrationStage::kSuccess: {
+      case SlotMigrationStage::kSuccess: {  // 迁移成功，发送 cluster import 命令通知目标节点导入完成，并更新当前节点的 migrated_slots_ 映射记录每个被迁移 slot 新节点的 ip:port
         auto s = finishSuccessfulMigration();
         if (s.IsOK()) {
           info("[migrate] Succeed to migrate slot(s) {}", slot_range_.load().String());
-          current_stage_ = SlotMigrationStage::kClean;
+          current_stage_ = SlotMigrationStage::kClean; // 下一个阶段：clean
           migration_state_ = MigrationState::kSuccess;
           resumeSyncCtx(s);
         } else {
@@ -256,7 +257,7 @@ void SlotMigrator::runMigrationProcess() {
         }
         break;
       }
-      case SlotMigrationStage::kFailed: {
+      case SlotMigrationStage::kFailed: { // 迁移失败，重试
         auto s = finishFailedMigration();
         if (!s.IsOK()) {
           error("[migrate] Failed to finish a failed migration of slot(s) {}. Error: {}", slot_range_.load().String(),s.Msg());
@@ -310,13 +311,13 @@ Status SlotMigrator::startMigration() {
   }
 
   // Set destination node import status to START
-  // 5. 向目标节点发送 IMPORT START 命令，通知目标开始接收迁移数据；若目标报错，则停止迁移。
+  // 5. 向目标节点发送 cluster import 命令，通知目标开始接收迁移数据；若目标报错，则停止迁移。
   auto s = setImportStatusOnDstNode(*dst_fd_, kImportStart);
   if (!s.IsOK()) {
     return s.Prefixed(errFailedToSetImportStatus);
   }
 
-  // 6. 读取配置中指定的迁移类型：
+  // 6. 读取配置中指定的迁移类型，并检查目标节点是否支持该类型，从而确定最终的迁移类型
   //  - kRawKeyValue: 使用 Kvrocks 自定义的 APPLYBATCH 命令，批量写入底层 RocksDB；
   //  - kRedisCommand: 使用标准 Redis 命令（如 SET, RPUSH 等）逐条迁移。
   migration_type_ = srv_->GetConfig()->migrate_type;
@@ -372,7 +373,7 @@ Status SlotMigrator::sendSnapshotByCmd() {
   // Construct key prefix to iterate the keys belong to the target slot
   //
   // Kvrocks 的所有 key 以 {namespace}:{slot_id}|key 格式存储；
-  // 这里根据 slot 范围构造 RocksDB 的遍历上下界，确保只遍历当前 slot 区间的 key。
+  // 这里根据 slot_range 范围构造 RocksDB 的遍历上下界，确保只遍历当前 slot_range 的 key。
   std::string prefix = ComposeSlotKeyPrefix(namespace_, slot_range.start);
   info("[migrate] Iterate keys of slot(s), key's prefix: {}", prefix);
   std::string upper_bound = ComposeSlotKeyUpperBound(namespace_, slot_range.end);
@@ -422,21 +423,24 @@ Status SlotMigrator::sendSnapshotByCmd() {
       return {Status::NotOK, fmt::format("failed to migrate a key {}: {}", user_key, result.Msg())};
     }
 
-    if (*result == KeyMigrationResult::kMigrated) {
+    if (*result == KeyMigrationResult::kMigrated) { // 迁移成功
       info("[migrate] The key {} successfully migrated", user_key);
       migrated_key_cnt++;
-    } else if (*result == KeyMigrationResult::kExpired) {
+    } else if (*result == KeyMigrationResult::kExpired) { // Key 已过期，无需迁移
       info("[migrate] The key {} is expired", user_key);
       expired_key_cnt++;
-    } else if (*result == KeyMigrationResult::kUnderlyingStructEmpty) {
+    } else if (*result == KeyMigrationResult::kUnderlyingStructEmpty) { // 空数据，无需迁移
       info("[migrate] The key {} has no elements", user_key);
       empty_key_cnt++;
-    } else {
+    } else { // 错误
       error("[migrate] Migrated a key {} with unexpected result: {}", user_key, static_cast<int>(*result));
       return {Status::NotOK};
     }
   }
 
+  // 运行到这里，有可能是 for loop 循环退出，也可能是遍历完当前 slot 而 break 退出；如果是前者，需要检查 iter 是否 valid ？
+  // 在使用 RocksDB 迭代器 iter->Next() 遍历 key 的过程中，有可能发生底层错误（例如磁盘损坏、sst文件丢失等），RocksDB 不会主动抛异常，而是通过 iter->status() 返回状态，
+  // 需要主动检查确认迭代器状态，如果忽略，可能会在迁移过程中错过一部分 key，但又不知道出了什么问题。
   if (auto s = iter->status(); !s.ok()) {
     auto err_str = s.ToString();
     error("[migrate] Failed to iterate keys of slot {}: {}", current_slot, err_str);
@@ -445,6 +449,9 @@ Status SlotMigrator::sendSnapshotByCmd() {
 
   // It's necessary to send commands that are still in the pipeline since the final pipeline may not be sent
   // while iterating keys because its size could be less than max_pipeline_size_
+  //
+  // 在遍历每个 key 时，我们会构造 Redis 命令并追加到 restore_cmds 中；只有当命令数达到 max_pipeline_size_ 时，才会触发发送（为了节省网络开销）。
+  // 所以最后一批，要强制发送。
   auto s = sendCmdsPipelineIfNeed(&restore_cmds, true);
   if (!s.IsOK()) {
     return s.Prefixed(errFailedToSendCommands);
@@ -455,14 +462,17 @@ Status SlotMigrator::sendSnapshotByCmd() {
 
 Status SlotMigrator::syncWALByCmd() {
   // Send incremental data from WAL circularly until new increment less than a certain amount
+  // 增量同步 wal ，直到追到距当前 lastest_seq 很近
   auto s = syncWalBeforeForbiddingSlot();
   if (!s.IsOK()) {
     return s.Prefixed("failed to sync WAL before forbidding a slot");
   }
 
+  // 对正在迁移的 slot_range 加锁
   setForbiddenSlotRange(slot_range_);
 
   // Send last incremental data
+  // 完成最后一部分的 wal 同步
   s = syncWalAfterForbiddingSlot();
   if (!s.IsOK()) {
     return s.Prefixed("failed to sync WAL after forbidding a slot");
@@ -472,25 +482,30 @@ Status SlotMigrator::syncWALByCmd() {
 }
 
 Status SlotMigrator::finishSuccessfulMigration() {
+  // 中止迁移？
   if (stop_migration_) {
     return {Status::NotOK, std::string(errMigrationTaskCanceled)};
   }
 
   // Set import status on the destination node to SUCCESS
+  // 通知目标节点迁移完成，可以结束导入状态
   auto s = setImportStatusOnDstNode(*dst_fd_, kImportSuccess);
   if (!s.IsOK()) {
     return s.Prefixed(errFailedToSetImportStatus);
   }
 
+  // 构造目标节点地址（IP:Port），用于记录和写入到集群元信息中。
   std::string dst_ip_port = dst_ip_ + ":" + std::to_string(dst_port_);
+
+  // 更新 slot_range_ 内每个 slot 的新归属节点
   s = srv_->cluster->SetSlotRangeMigrated(slot_range_, dst_ip_port);
   if (!s.IsOK()) {
     return s.Prefixed(
         fmt::format("failed to set slot(s) {} as migrated to {}", slot_range_.load().String(), dst_ip_port));
   }
 
+  // 重置变量
   migrate_failed_slot_range_ = {-1, -1};
-
   return Status::OK();
 }
 
@@ -510,6 +525,8 @@ Status SlotMigrator::finishFailedMigration() {
 
 void SlotMigrator::clean() {
   info("[migrate] Clean resources of migrating slot(s) {}", slot_range_.load().String());
+
+  // 释放快照
   if (slot_snapshot_) {
     storage_->GetDB()->ReleaseSnapshot(slot_snapshot_);
     slot_snapshot_ = nullptr;
@@ -541,15 +558,27 @@ Status SlotMigrator::authOnDstNode(int sock_fd, const std::string &password) {
 }
 
 Status SlotMigrator::setImportStatusOnDstNode(int sock_fd, int status) {
+  // 检查 socket 文件描述符是否有效
   if (sock_fd <= 0) return {Status::NotOK, "invalid socket descriptor"};
 
+  // 构造 Redis 命令：
+  //    cluster import <slot_range> <status>
+  // 其中：
+  //  status：
+  //   - 0: 开始导入
+  //   - 1: 成功
+  //   - 2: 失败
+  //   - 3: 未知
   std::string cmd =
       redis::ArrayOfBulkStrings({"cluster", "import", slot_range_.load().String(), std::to_string(status)});
+
+  // 发送到目标节点
   auto s = util::SockSend(sock_fd, cmd);
   if (!s.IsOK()) {
     return s.Prefixed("failed to send command to the destination node");
   }
 
+  // 读取响应
   s = checkSingleResponse(sock_fd);
   if (!s.IsOK()) {
     return s.Prefixed("failed to check the response from the destination node");
@@ -1084,22 +1113,27 @@ Status SlotMigrator::migrateBitmapKey(const InternalKey &inkey, std::unique_ptr<
 }
 
 Status SlotMigrator::sendCmdsPipelineIfNeed(std::string *commands, bool need) {
+  // 中止迁移？
   if (stop_migration_) {
     return {Status::NotOK, std::string(errMigrationTaskCanceled)};
   }
 
   // Check pipeline
+  // 是否强制发送？是否攒够一批？
   if (!need && current_pipeline_size_ < max_pipeline_size_) {
     return Status::OK();
   }
 
+  // 如果 pipeline 是空的，也无需发送
   if (current_pipeline_size_ == 0) {
     info("[migrate] No commands to send");
     return Status::OK();
   }
 
+  // 控制发送速率 sleep a while
   applyMigrationSpeedLimit();
 
+  // 发送数据
   auto s = util::SockSend(*dst_fd_, *commands);
   if (!s.IsOK()) {
     return s.Prefixed("failed to write data to a socket");
@@ -1107,22 +1141,30 @@ Status SlotMigrator::sendCmdsPipelineIfNeed(std::string *commands, bool need) {
 
   last_send_time_ = util::GetTimeStampUS();
 
+  // 因为 Redis 是请求-响应协议，发送几条命令就必须读几条回复。
   s = checkMultipleResponses(*dst_fd_, current_pipeline_size_);
   if (!s.IsOK()) {
     return s.Prefixed("wrong response from the destination node");
   }
 
   // Clear commands and running pipeline
+  // 变量重置，方便下次发送
   commands->clear();
   current_pipeline_size_ = 0;
 
   return Status::OK();
 }
 
+// 在 slot 迁移过程的后半段，为了保证数据一致性，源端必须禁止该 slot 上的所有写入。
+// 因为快照数据已经迁移，增量数据也已通过 WAL 迁移，但是迁移过程中有源源不断的新写入，会导致 WAL 同步始终无法结束；
+// 所以最终阶段必须加锁禁止写入，设置 “forbidden slot” 。
 void SlotMigrator::setForbiddenSlotRange(const SlotRange &slot_range) {
   info("[migrate] Setting forbidden slot(s) {}", slot_range.String());
   // Block server to set forbidden slot
   uint64_t during = util::GetTimeStampUS();
+  // 加锁保护 forbidden_slot_range_ 写操作，避免并发问题；
+  //  - srv_->WorkExclusivityGuard() 返回一个 RAII 互斥锁，在大括号作用域内保护 forbidden_slot_range_ 并发访问。
+  //  - forbidden_slot_range_ 成员变量用于标记 “当前禁止写入的槽位范围” ，避免始终无法完成迁移。
   {
     auto exclusivity = srv_->WorkExclusivityGuard();
     forbidden_slot_range_ = slot_range;
@@ -1173,21 +1215,29 @@ Status SlotMigrator::generateCmdsFromBatch(rocksdb::BatchResult *batch, std::str
 }
 
 Status SlotMigrator::migrateIncrementData(std::unique_ptr<rocksdb::TransactionLogIterator> *iter, uint64_t end_seq) {
+  // 检查 WAL 迭代器是否有效，如果无效则无法读取增量日志，直接报错。
   if (!(*iter) || !(*iter)->Valid()) {
     error("[migrate] WAL iterator is invalid");
     return {Status::NotOK};
   }
 
-  uint64_t next_seq = wal_begin_seq_ + 1;
-  std::string commands;
+  uint64_t next_seq = wal_begin_seq_ + 1; // 同步序号
+  std::string commands; // 用于拼接待发送的 Redis 命令字符串（pipeline 模式）。
 
   while (true) {
+    // 停止迁移？
     if (stop_migration_) {
       error("[migrate] Migration task end during migrating WAL data");
       return {Status::NotOK};
     }
 
+    // 在 RocksDB 中 WAL 数据是以 WriteBatch 为单位的，每个 batch 表示一次用户操作（SET、DEL 等）提交的写集合。
     auto batch = (*iter)->GetBatch();
+    // WAL 是严格按顺序追加的，正常情况下每个 batch 的序列号是连续的，如果出现跳跃，可能是：
+    //  - RocksDB 被压缩、合并导致部分写被丢弃；
+    //  - WAL 被截断；
+    //  - 存储系统异常。
+    // 一旦发现序号不连续，说明数据不完整，不能迁移。
     if (batch.sequence != next_seq) {
       error("[migrate] WAL iterator is discrete, some seq might be lost, expected sequence: {}, but got sequence: {}",
             next_seq, batch.sequence);
@@ -1195,6 +1245,7 @@ Status SlotMigrator::migrateIncrementData(std::unique_ptr<rocksdb::TransactionLo
     }
 
     // Generate commands by iterating write batch
+    // 将 WriteBatch 转换为 Redis 命令，追加到 commands 中（猜测：这里可能会过滤掉不属于当前 slot_range_ 的 keys）
     auto s = generateCmdsFromBatch(&batch, &commands);
     if (!s.IsOK()) {
       error("[migrate] Failed to generate commands from write batch");
@@ -1202,26 +1253,31 @@ Status SlotMigrator::migrateIncrementData(std::unique_ptr<rocksdb::TransactionLo
     }
 
     // Check whether command pipeline should be sent
+    // 尝试发送数据，如果积累的命令数量未达到阈值，不会立即发送，但也会返回 ok ；
     s = sendCmdsPipelineIfNeed(&commands, false);
     if (!s.IsOK()) {
       error("[migrate] Failed to send WAL commands pipeline");
       return {Status::NotOK};
     }
 
+    // 更新下一个期望序列号，每个 batch 可能包含多个写操作。
     next_seq = batch.sequence + batch.writeBatchPtr->Count();
+    // 如果我们已经处理完所有期望范围内的日志（从 wal_begin_seq_+1 到 end_seq），退出循环。
     if (next_seq > end_seq) {
       info("[migrate] Migrate incremental data an epoch OK, seq from {}, to {}", wal_begin_seq_, end_seq);
       break;
     }
 
+    // 继续读取下一个 batch
     (*iter)->Next();
-    if (!(*iter)->Valid()) {
+    if (!(*iter)->Valid()) { // 检查是否有效
       error("[migrate] WAL iterator is invalid, expected end seq: {}, next seq: {}", end_seq, next_seq);
       return {Status::NotOK};
     }
   }
 
   // Send the left data of this epoch
+  // 发送最后一批命令
   auto s = sendCmdsPipelineIfNeed(&commands, true);
   if (!s.IsOK()) {
     error("[migrate] Failed to send WAL last commands in pipeline");
@@ -1231,18 +1287,29 @@ Status SlotMigrator::migrateIncrementData(std::unique_ptr<rocksdb::TransactionLo
   return Status::OK();
 }
 
+
+// 在迁移过程中，主流程分为两个阶段：
+//  - 迁移 snapshot（旧数据）
+//  - 迁移 WAL（增量写入数据）
+// 在迁移完 snapshot 后，可能仍有客户端在写数据（写入 RocksDB -> WAL）。
+// 此函数的作用就是：在当前节点禁用这个 slot 前，把 WAL 中最新写入的变更都尽量迁移出去，确保迁移数据不会漏。
 Status SlotMigrator::syncWalBeforeForbiddingSlot() {
   uint32_t count = 0;
 
+  // 设定最多循环次数，每次迭代会同步一批增量数据。
   while (count < kMaxLoopTimes) {
+    // 获取当前最新的 WAL 序列号
     uint64_t latest_seq = storage_->GetDB()->GetLatestSequenceNumber();
+    // 根据已同步完的 snapshot 序号计算 gap ，即这段时间新增的数据量
     uint64_t gap = latest_seq - wal_begin_seq_;
+    // 如果 gap 很小，说明变更数据已经 “追得差不多了”，此时就可以放心地设置 forbid ，不用再等
     if (gap <= static_cast<uint64_t>(seq_gap_limit_)) {
       info("[migrate] Incremental data sequence: {}, less than limit: {}, go to set forbidden slot", gap,
            seq_gap_limit_);
       break;
     }
 
+    // 创建一个 WAL 迭代器，从 wal_begin_seq_ + 1 开始读取变更并进行迁移
     std::unique_ptr<rocksdb::TransactionLogIterator> iter = nullptr;
     auto s = storage_->GetWALIter(wal_begin_seq_ + 1, &iter);
     if (!s.IsOK()) {
@@ -1251,19 +1318,23 @@ Status SlotMigrator::syncWalBeforeForbiddingSlot() {
     }
 
     // Iterate wal and migrate data
+    // 执行 wal 的增量同步，完成 [wal_begin_seq_+1, latest_seq] 区间的数据同步
     s = migrateIncrementData(&iter, latest_seq);
     if (!s.IsOK()) {
       error("[migrate] Failed to migrate WAL data before setting forbidden slot");
       return {Status::NotOK};
     }
 
+    // 因为同步过程中可能还有新数据写入，所以开始下一次增量同步，直到 gap 小于指定阈值
     wal_begin_seq_ = latest_seq;
     count++;
   }
+
   info("[migrate] Succeed to migrate incremental data before setting forbidden slot, end epoch: {}", count);
   return Status::OK();
 }
 
+// 在禁止写入某个 slot 之后，同步这期间产生的增量数据（通过 WAL 日志），完成最后的收尾工作。
 Status SlotMigrator::syncWalAfterForbiddingSlot() {
   uint64_t latest_seq = storage_->GetDB()->GetLatestSequenceNumber();
 
@@ -1330,7 +1401,7 @@ void SlotMigrator::CancelSyncCtx() {
 void SlotMigrator::resumeSyncCtx(const Status &migrate_result) {
   std::unique_lock<std::mutex> lock(blocking_mutex_);
   if (blocking_context_) {
-    blocking_context_->Resume(migrate_result);
+    blocking_context_->Resume(migrate_result); // [重要] 通知迁移已经完成
 
     blocking_context_ = nullptr;
   }

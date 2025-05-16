@@ -57,8 +57,10 @@ Cluster::Cluster(Server *srv, std::vector<std::string> binds, int port)
 bool Cluster::SubCommandIsExecExclusive(const std::string &subcommand) {
   std::array subcommands = {"setnodes", "setnodeid", "setslot", "import", "reset"};
 
-  return std::any_of(std::begin(subcommands), std::end(subcommands),
-                     [&subcommand](const std::string &val) { return util::EqualICase(val, subcommand); });
+  return std::any_of(std::begin(subcommands),
+                     std::end(subcommands),
+                     [&subcommand](const std::string &val) { return util::EqualICase(val, subcommand); }
+                     );
 }
 
 Status Cluster::SetNodeId(const std::string &node_id) {
@@ -85,22 +87,27 @@ Status Cluster::SetNodeId(const std::string &node_id) {
 // This is different with CLUSTERX SETNODES commands because it uses new version
 // topology to cover current version, it allows kvrocks nodes lost some topology
 // updates since of network failure, it is state instead of operation.
-Status Cluster::SetSlotRanges(const std::vector<SlotRange> &slot_ranges, const std::string &node_id,
-                              int64_t new_version) {
+//
+// 更新槽(slot)分配关系
+Status Cluster::SetSlotRanges(const std::vector<SlotRange> &slot_ranges, const std::string &node_id, int64_t new_version) {
+  // 版本号线性递增
   if (new_version <= 0 || new_version != version_ + 1) {
     return {Status::NotOK, errInvalidClusterVersion};
   }
 
+  // 节点 ID 固定长度
   if (node_id.size() != kClusterNodeIdLen) {
     return {Status::NotOK, errInvalidNodeID};
   }
 
   // Get the node which we want to assign slots into it
+  // 目标节点存在
   std::shared_ptr<ClusterNode> to_assign_node = nodes_[node_id];
   if (to_assign_node == nullptr) {
     return {Status::NotOK, "No this node in the cluster"};
   }
 
+  // 目标节点是主节点
   if (to_assign_node->role != kClusterMaster) {
     return {Status::NotOK, errNoMasterNode};
   }
@@ -117,17 +124,21 @@ Status Cluster::SetSlotRanges(const std::vector<SlotRange> &slot_ranges, const s
   engine::Context ctx(srv_->storage);
   for (auto [s_start, s_end] : slot_ranges) {
     for (int slot = s_start; slot <= s_end; slot++) {
+      // 1. 从旧节点移除槽位
       std::shared_ptr<ClusterNode> old_node = slots_nodes_[slot];
       if (old_node != nullptr) {
         old_node->slots[slot] = false;
       }
+      // 2. 向新节点添加槽位
       to_assign_node->slots[slot] = true;
       slots_nodes_[slot] = to_assign_node;
 
       // Clear data of migrated slot or record of imported slot
+      // 3. 如果是本节点迁出的 slot，还需要清理旧数据
       if (old_node == myself_ && old_node != to_assign_node) {
         // If slot is migrated from this node
         if (migrated_slots_.count(slot) > 0) {
+          // 清理本节点中该 slot 的 key 数据
           auto s = srv_->slot_migrator->ClearKeysOfSlotRange(ctx, kDefaultNamespace, SlotRange::GetPoint(slot));
           if (!s.ok()) {
             error("failed to clear data of migrated slot: {}", s.ToString());
@@ -135,6 +146,7 @@ Status Cluster::SetSlotRanges(const std::vector<SlotRange> &slot_ranges, const s
           migrated_slots_.erase(slot);
         }
         // If slot is imported into this node
+        // 清除导入记录
         if (imported_slots_.count(slot) > 0) {
           imported_slots_.erase(slot);
         }
@@ -170,6 +182,12 @@ Status Cluster::SetSlotRanges(const std::vector<SlotRange> &slot_ranges, const s
  * 2. 会自动识别当前节点ID(匹配IP和端口)
  * 3. 会清除已迁移槽位的数据
  */
+// 官网：
+//  Kvrocks 提供了 CLUSTERX SETNODES 命令设置拓扑结构，需要注意的是，由于集群中的节点不会相互进行通信，
+//  所以该命令中的集群拓扑是整个集群的拓扑结构，而且也需要对集群中的所有节点都得执行拓扑结构的设置。
+//
+//  - VERSION: 新拓扑结构的版本号，为了避免拓扑被无序的错误修改，只有当新的拓扑结构版本号大于当前拓扑结构的版本号时才能更新集群拓扑结构。
+//  - FORCE: 强制更新，命令中带有 force flag 时 Kvrocks 不会进行 VERSION 校验， 用于在集群拓扑结构管理混乱或出错时，强行设置集群拓扑结构。
 Status Cluster::SetClusterNodes(const std::string &nodes_str, int64_t version, bool force) {
   // 版本号检查
   if (version < 0) return {Status::NotOK, errInvalidClusterVersion};
@@ -241,6 +259,7 @@ Status Cluster::SetClusterNodes(const std::string &nodes_str, int64_t version, b
     engine::Context ctx(srv_->storage);
     for (const auto &[slot, _] : migrated_slots_) {
       if (slots_nodes_[slot] != myself_) {
+        // 清理本节点中该 slot 的 key 数据
         auto s = srv_->slot_migrator->ClearKeysOfSlotRange(ctx, kDefaultNamespace, SlotRange::GetPoint(slot));
         if (!s.ok()) {
           error("failed to clear data of migrated slots: {}", s.ToString());
@@ -309,6 +328,9 @@ Status Cluster::SetMasterSlaveRepl() {
 
 bool Cluster::IsNotMaster() { return myself_ == nullptr || myself_->role != kClusterMaster || srv_->IsSlave(); }
 
+
+// 将指定的 slot_range 标记为已迁移成功，并更新本节点的 migrated_slots_ 映射表，指明这些 slot 现在归属于哪个目标节点 ip_port 。
+// 当前节点在收到这些 slot 请求时，返回 -MOVED ，并提供目标节点地址（如：-MOVED 12345 10.1.1.33:6666）；
 Status Cluster::SetSlotRangeMigrated(const SlotRange &slot_range, const std::string &ip_port) {
   if (!slot_range.IsValid()) {
     return {Status::NotOK, errSlotRangeInvalid};
@@ -337,54 +359,68 @@ Status Cluster::SetSlotRangeImported(const SlotRange &slot_range) {
   return Status::OK();
 }
 
-Status Cluster::MigrateSlotRange(const SlotRange &slot_range, const std::string &dst_node_id,
-                                 SyncMigrateContext *blocking_ctx) {
+
+// CMD: CLUSTERX MIGRATE $slot_range $dst_nodeid $dst_nodeid
+//
+// 将当前节点（myself）负责的一段 slot 范围迁移到另一个 master 节点。
+//
+// 官网说明:
+//   DBA 通过 CLUSTERX MIGRATE 命令进行 slot 迁移，即可完成一个特定 slot 数据的迁移。
+//   该命令会先迁移该 slot 的全量数据，再迁移增量数据，从而保证数据的正确性。
+//   当 slot 数据迁移完成后，数据迁移的源节点会回复 MOVED 错误告知 SDK 需要重定向到目标节点。
+//   为了保证拓扑结构的正确性，Kvrocks 不会直接更改拓扑结构，也不会清理数据，需要管控节通过 CLUSTER SETSLOT 命令更改，当然也需要对集群中所有节点执行该命令。
+Status Cluster::MigrateSlotRange(const SlotRange &slot_range, const std::string &dst_node_id, SyncMigrateContext *blocking_ctx) {
+  // 目标节点是否存在
   if (nodes_.find(dst_node_id) == nodes_.end()) {
     return {Status::NotOK, "Can't find the destination node id"};
   }
-
+  // 检查 slot 范围是否合法
   if (!slot_range.IsValid()) {
     return {Status::NotOK, errSlotRangeInvalid};
   }
-
-  if (!migrated_slots_.empty() &&
-      slot_range.HasOverlap({migrated_slots_.begin()->first, migrated_slots_.rbegin()->first})) {
+  // 检查 slot 是否已经迁移过（防止重复迁移）
+  if (!migrated_slots_.empty() && slot_range.HasOverlap({migrated_slots_.begin()->first, migrated_slots_.rbegin()->first})) {
     return {Status::NotOK, "Can't migrate slot which has been migrated"};
   }
-
+  // 检查每个 slot 是否属于当前节点，存在不属于当前节点的 slot 就报错
   for (auto slot = slot_range.start; slot <= slot_range.end; slot++) {
     if (slots_nodes_[slot] != myself_) {
       return {Status::NotOK, "Can't migrate slot which doesn't belong to me"};
     }
   }
-
+  // 只有 master 才能执行迁移操作
   if (IsNotMaster()) {
     return {Status::NotOK, "Slave can't migrate slot"};
   }
-
+  // 目标节点也必须是 master
   if (nodes_[dst_node_id]->role != kClusterMaster) {
     return {Status::NotOK, "Can't migrate slot to a slave"};
   }
-
+  // 不能迁移给自己
   if (nodes_[dst_node_id] == myself_) {
     return {Status::NotOK, "Can't migrate slot to myself"};
   }
 
+  // 创建后台迁移任务，立即返回
   const auto &dst = nodes_[dst_node_id];
-  Status s =
-      srv_->slot_migrator->PerformSlotRangeMigration(dst_node_id, dst->host, dst->port, slot_range, blocking_ctx);
+  Status s = srv_->slot_migrator->PerformSlotRangeMigration(dst_node_id, dst->host, dst->port, slot_range, blocking_ctx);
   return s;
 }
 
+// CMD: CLUSTER IMPORT $slot_range $state
+//
+// It is an internal command to notify the destination server to prepare for data importing.
+// This command cannot be used by clients.
 Status Cluster::ImportSlotRange(redis::Connection *conn, const SlotRange &slot_range, int state) {
+  // 只有 master 才能导入 slot
   if (IsNotMaster()) {
     return {Status::NotOK, "Slave can't import slot"};
   }
-
+  // 检查 slot 范围合法性
   if (!slot_range.IsValid()) {
     return {Status::NotOK, errSlotRangeInvalid};
   }
-
+  // 不能导入已经属于本节点的 slot
   for (auto slot = slot_range.start; slot <= slot_range.end; slot++) {
     auto source_node = srv_->cluster->slots_nodes_[slot];
     if (source_node && source_node->id == myid_) {
@@ -392,22 +428,27 @@ Status Cluster::ImportSlotRange(redis::Connection *conn, const SlotRange &slot_r
     }
   }
 
+  // 根据导入状态执行不同逻辑
   Status s;
   switch (state) {
-    case kImportStart:
+    case kImportStart: // 开始导入
+
       s = srv_->slot_import->Start(slot_range);
       if (!s.IsOK()) return s;
 
       // Set link importing
       conn->SetImporting();
       myself_->importing_slot_range = slot_range;
+
       // Set link error callback
       conn->close_cb = [object_ptr = srv_->slot_import.get(), slot_range]([[maybe_unused]] int fd) {
         auto s = object_ptr->StopForLinkError();
         if (!s.IsOK()) {
           error("[import] Failed to stop importing slot(s) {}: {}", slot_range.String(), s.Msg());
         }
-      };  // Stop forbidding writing slot to accept write commands
+      };
+
+      // Stop forbidding writing slot to accept write commands
       if (slot_range.HasOverlap(srv_->slot_migrator->GetForbiddenSlotRange())) {
         // This approach assumes a shard only handles one migration task at a time.
         // When executing the import logic, the absence of other outgoing migrations on this shard justifies safely
@@ -415,6 +456,7 @@ Status Cluster::ImportSlotRange(redis::Connection *conn, const SlotRange &slot_r
         // supported in the future.
         srv_->slot_migrator->ReleaseForbiddenSlotRange();
       }
+
       info("[import] Start importing slot(s) {}", slot_range.String());
       break;
     case kImportSuccess:
@@ -720,7 +762,9 @@ Status Cluster::DumpClusterNodes(const std::string &file) {
   return Status::OK();
 }
 
+// LoadClusterNodes 用于 Kvrocks 从 nodes.conf 等配置文件中恢复集群节点信息，包括本节点 ID、版本号和集群节点列表等。
 Status Cluster::LoadClusterNodes(const std::string &file_path) {
+  // 如果文件不存在，不报错 —— 视为首次启动；可使用 CLUSTERX 命令重新配置集群。
   if (rocksdb::Env::Default()->FileExists(file_path).IsNotFound()) {
     info("The cluster nodes file {} is not found. Use CLUSTERX subcommands to specify it.", file_path);
     return Status::OK();
@@ -728,18 +772,21 @@ Status Cluster::LoadClusterNodes(const std::string &file_path) {
 
   std::ifstream file;
   file.open(file_path);
-  if (!file.is_open()) {
+  if (!file.is_open()) { // 打开文件失败
     return {Status::NotOK, fmt::format("error opening the file '{}': {}", file_path, strerror(errno))};
   }
 
   int64_t version = -1;
   std::string id, nodes_info;
   std::string line;
+  // 逐行解析文件内容
   while (file.good() && std::getline(file, line)) {
+    // 返回 std::pair<string, string>
     auto parsed = ParseConfigLine(line);
     if (!parsed) return parsed.ToStatus().Prefixed("malformed line");
     if (parsed->first.empty() || parsed->second.empty()) continue;
 
+    // 处理支持的键值对
     auto key = parsed->first;
     if (key == "version") {
       auto parse_result = ParseInt<int64_t>(parsed->second, 10);
@@ -749,7 +796,7 @@ Status Cluster::LoadClusterNodes(const std::string &file_path) {
       version = *parse_result;
     } else if (key == "id") {
       id = parsed->second;
-      if (id.length() != kClusterNodeIdLen) {
+      if (id.length() != kClusterNodeIdLen) { // 必须是固定长度
         return {Status::NotOK, errInvalidNodeID};
       }
     } else if (key == "node") {
@@ -759,7 +806,9 @@ Status Cluster::LoadClusterNodes(const std::string &file_path) {
     }
   }
 
+  // 设置当前节点 ID
   myid_ = id;
+  // 更新内存中节点配置信息
   return SetClusterNodes(nodes_info, version, false);
 }
 
@@ -933,6 +982,7 @@ Status Cluster::CanExecByMySelf(const redis::CommandAttributes *attributes,
                                 const std::vector<std::string> &cmd_tokens,
                                 redis::Connection *conn,
                                 lua::ScriptRunCtx *script_run_ctx) {
+  // 提取命令中的 key 的位置
   std::vector<int> key_indexes;
 
   attributes->ForEachKeyRange(
@@ -943,6 +993,9 @@ Status Cluster::CanExecByMySelf(const redis::CommandAttributes *attributes,
 
   if (key_indexes.empty()) return Status::OK();
 
+
+  // 所有 key 必须属于 同一个 slot
+  // Redis Cluster 限制单条命令只能操作同一个 slot 中的 key ，否则报错 CROSSSLOT 。
   int slot = -1;
   for (auto i : key_indexes) {
     if (i >= static_cast<int>(cmd_tokens.size())) break;
@@ -955,11 +1008,16 @@ Status Cluster::CanExecByMySelf(const redis::CommandAttributes *attributes,
   }
   if (slot == -1) return Status::OK();
 
+  // 如果该 slot 没有任何节点负责，报 CLUSTERDOWN
   if (slots_nodes_[slot] == nullptr) {
     return {Status::RedisClusterDown, "Hash slot not served"};
   }
 
   bool cross_slot_ok = false;
+
+  // 对 Lua 脚本特殊处理：
+  //  - 脚本中的多个命令需要 使用相同的 slot；
+  //  - 如果不是，只有设置了 kScriptAllowCrossSlotKeys 才允许；但是这些 slot 仍然落在同一个节点上。
   if (script_run_ctx) {
     if (script_run_ctx->current_slot != -1 && script_run_ctx->current_slot != slot) {
       if (getNodeIDBySlot(script_run_ctx->current_slot) != getNodeIDBySlot(slot)) {
@@ -976,22 +1034,27 @@ Status Cluster::CanExecByMySelf(const redis::CommandAttributes *attributes,
 
   uint64_t flags = attributes->GenerateFlags(cmd_tokens);
 
+  // 本节点是 slot 的拥有者 && 没有迁移中，就允许执行
   if (myself_ && myself_ == slots_nodes_[slot]) {
     // We use central controller to manage the topology of the cluster.
     // Server can't change the topology directly, so we record the migrated slots
     // to move the requests of the migrated slots to the destination node.
     if (migrated_slots_.count(slot) > 0) {  // I'm not serving the migrated slot
-      return {Status::RedisMoved, fmt::format("{} {}", slot, migrated_slots_[slot])};
+      return {Status::RedisMoved, fmt::format("{} {}", slot, migrated_slots_[slot])}; // 我已经迁走这个 slot
     }
     // To keep data consistency, slot will be forbidden write while sending the last incremental data.
     // During this phase, the requests of the migrating slot has to be rejected.
+    //
+    // [重要] 这里可见，migrate 的最后阶段是加锁的，直接拒绝写操作！
     if ((flags & redis::kCmdWrite) && IsWriteForbiddenSlot(slot)) {
-      return {Status::RedisTryAgain, "Can't write to slot being migrated which is in write forbidden phase"};
+      return {Status::RedisTryAgain, "Can't write to slot being migrated which is in write forbidden phase"}; // 正在迁移数据，写请求不允许
     }
 
     return Status::OK();  // I'm serving this slot
   }
 
+  // 虽然 slot 尚未归属我，但我允许 ASKING 或 importing 请求
+  //  - ASKING 命令是 Redis Cluster 的一种机制；让即将成为 slot 主节点的目标可以临时接受该 slot 的请求。
   if (myself_ && myself_->importing_slot_range.Contains(slot) &&
       (conn->IsImporting() || conn->IsFlagEnabled(redis::Connection::kAsking))) {
     // While data migrating, the topology of the destination node has not been changed.
@@ -1001,6 +1064,7 @@ Status Cluster::CanExecByMySelf(const redis::CommandAttributes *attributes,
     return Status::OK();  // I'm serving the importing connection or asking connection
   }
 
+  // slot 已导入但尚未更新拓扑：接受请求
   if (myself_ && imported_slots_.count(slot)) {
     // After the slot is migrated, new requests of the migrated slot will be moved to
     // the destination server. Before the central controller change the topology, the destination
@@ -1008,15 +1072,17 @@ Status Cluster::CanExecByMySelf(const redis::CommandAttributes *attributes,
     return Status::OK();  // I'm serving the imported slot
   }
 
+  // 我是 slave，但是读请求，并且我的主节点是 slot 拥有者，且客户端设置了 readonly ，此时可以从我这里读
   if (myself_
       && myself_->role == kClusterSlave
       && !(flags & redis::kCmdWrite)
       && nodes_.find(myself_->master_id) != nodes_.end()
       && nodes_[myself_->master_id] == slots_nodes_[slot]
       && conn->IsFlagEnabled(redis::Connection::kReadOnly)) {
-    return Status::OK();  // My master is serving this slot
+    return Status::OK();  // My master is serving this slot =>  主节点拥有该 slot 的从节点可读
   }
 
+  // 默认返回 MOVED，指向 slot 的主节点地址
   if (!cross_slot_ok) {
     return {Status::RedisMoved, fmt::format("{} {}:{}", slot, slots_nodes_[slot]->host, slots_nodes_[slot]->port)};
   }

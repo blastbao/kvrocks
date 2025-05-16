@@ -225,6 +225,9 @@ class SlotMigrator : public redis::Database {
   MigrationType migration_type_ = MigrationType::kRedisCommand;
 
   static_assert(std::atomic<SlotRange>::is_always_lock_free, "SlotRange is not lock free.");
+
+  // 此变量作用：在迁移 slot 的最后阶段（增量同步完成后、开始切换拓扑前），临时禁止对该 slot 的写操作，确保迁移结束前数据不会再变动，保证数据一致性。
+  // Q: 在迁移成功后，为什么 forbidden_slot_range_ 变量没有被重置？
   std::atomic<SlotRange> forbidden_slot_range_ = SlotRange{-1, -1};
   std::atomic<SlotRange> slot_range_ = SlotRange{-1, -1};
   std::atomic<SlotRange> migrate_failed_slot_range_ = SlotRange{-1, -1};

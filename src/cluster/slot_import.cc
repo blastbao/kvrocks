@@ -35,8 +35,7 @@ Status SlotImport::Start(const SlotRange &slot_range) {
     if (import_slot_range_ == slot_range) {
       return Status::OK();
     }
-    return {Status::NotOK,
-            fmt::format("only one importing job is allowed, current importing: {}", import_slot_range_.String())};
+    return {Status::NotOK,fmt::format("only one importing job is allowed, current importing: {}", import_slot_range_.String())};
   }
 
   // Clean slot data first

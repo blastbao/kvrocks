@@ -88,8 +88,7 @@ class Cluster {
   Status CanExecByMySelf(const redis::CommandAttributes *attributes, const std::vector<std::string> &cmd_tokens,
                          redis::Connection *conn, lua::ScriptRunCtx *script_run_ctx = nullptr);
   Status SetMasterSlaveRepl();
-  Status MigrateSlotRange(const SlotRange &slot_range, const std::string &dst_node_id,
-                          SyncMigrateContext *blocking_ctx = nullptr);
+  Status MigrateSlotRange(const SlotRange &slot_range, const std::string &dst_node_id, SyncMigrateContext *blocking_ctx = nullptr);
   Status ImportSlotRange(redis::Connection *conn, const SlotRange &slot_range, int state);
   std::string GetMyId() const { return myid_; }
   Status DumpClusterNodes(const std::string &file);

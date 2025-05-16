@@ -276,19 +276,23 @@ class CommandClusterX : public Commander {
     } else if (subcommand_ == "myid") {
       *output = redis::BulkString(srv->cluster->GetMyId());
     } else if (subcommand_ == "migrate") {
+      // 如果是同步迁移，构造 sync_migrate_ctx_ 用于监听后台迁移任务的结束
       if (sync_migrate_) {
         sync_migrate_ctx_ = std::make_unique<SyncMigrateContext>(srv, conn, sync_migrate_timeout_);
       }
+
       // TODO: support multiple slot ranges
+      // 启动后台迁移线程
       Status s = srv->cluster->MigrateSlotRange(slot_ranges_[0], dst_node_id_, sync_migrate_ctx_.get());
       if (s.IsOK()) {
         if (sync_migrate_) {
-          return {Status::BlockingCmd};
+          return {Status::BlockingCmd}; // 启动成功，通知客户端阻塞
         }
-        *output = redis::RESP_OK;
+        *output = redis::RESP_OK; // 启动成功
       } else {
-        return s;
+        return s; // 启动失败
       }
+
     } else {
       return {Status::RedisExecErr, "Invalid cluster command options"};
     }

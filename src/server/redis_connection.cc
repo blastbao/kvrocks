@@ -353,8 +353,10 @@ void Connection::RecordProfilingSampleIfNeed(const std::string &cmd, uint64_t du
   srv_->GetPerfLog()->PushEntry(std::move(entry));
 }
 
-Status Connection::ExecuteCommand(engine::Context &ctx, const std::string &cmd_name,
-                                  const std::vector<std::string> &cmd_tokens, Commander *current_cmd,
+Status Connection::ExecuteCommand(engine::Context &ctx,
+                                  const std::string &cmd_name,
+                                  const std::vector<std::string> &cmd_tokens,
+                                  Commander *current_cmd,
                                   std::string *reply) {
   srv_->stats.IncrCalls(cmd_name);
 
