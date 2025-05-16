@@ -257,20 +257,25 @@ RedisType Metadata::Type() const { return static_cast<RedisType>(flags & METADAT
 
 const std::string &Metadata::TypeName() const { return RedisTypeNames[Type()]; }
 
+// 将指针跳过 flags + expire，指向下一个字段。
+// Kvrocks 经常用这种 "偏移法" 来访问数据结构(Metadata)内的某个字段。
 size_t Metadata::GetOffsetAfterExpire(uint8_t flags) {
+  // 根据 flags 判断 Metadata 的编码方式是 64 位模式（一般是为了解决时间戳精度问题），那么 expire 用 8 字节；
   if (flags & METADATA_64BIT_ENCODING_MASK) {
-    return 1 + 8;
+    return 1 + 8; // 1B 的 flags + 8B 的 expire 时间戳
   }
-
-  return 1 + 4;
+  // 默认使用 32 位时间戳，即 4 字节；
+  return 1 + 4;   // 1B 的 flags + 4B 的 expire 时间戳
 }
 
+// 将指针跳过 flags + expire + version + size，指向下一个字段。
 size_t Metadata::GetOffsetAfterSize(uint8_t flags) {
+  // 64 位
   if (flags & METADATA_64BIT_ENCODING_MASK) {
-    return 1 + 8 + 8 + 8;
+    return 1 + 8 + 8 + 8; // flags + expire + version + size
   }
-
-  return 1 + 4 + 8 + 4;
+  // 32 位
+  return 1 + 4 + 8 + 4;    // flags + expire + version + size
 }
 
 uint64_t Metadata::ExpireMsToS(uint64_t ms) {
@@ -366,8 +371,7 @@ bool Metadata::ExpireAt(uint64_t expired_ts) const {
 bool Metadata::IsSingleKVType() const { return Type() == kRedisString || Type() == kRedisJson; }
 
 bool Metadata::IsEmptyableType() const {
-  return IsSingleKVType() || Type() == kRedisStream || Type() == kRedisBloomFilter || Type() == kRedisHyperLogLog ||
-         Type() == kRedisTDigest;
+  return IsSingleKVType() || Type() == kRedisStream || Type() == kRedisBloomFilter || Type() == kRedisHyperLogLog || Type() == kRedisTDigest;
 }
 
 bool Metadata::Expired() const { return ExpireAt(util::GetTimeStampMS()); }

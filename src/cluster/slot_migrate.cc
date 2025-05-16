@@ -410,6 +410,10 @@ Status SlotMigrator::sendSnapshotByCmd() {
 
     // Get user key
     // 提取用户原始 key
+    //
+    // 为什么要提取 user_key ？
+    // 因为 RocksDB 的底层 key 是 Kvrocks 内部结构，以 Redis 协议来传递它，目标 Redis 实例不懂。
+    // 必须从 RocksDB 的 key 中提取出用户原始 key（user_key），搭配 value，一起构造 Redis 的 RESTORE 或 SET 命令发送给目标实例。
     auto [_, user_key] = ExtractNamespaceKey(iter->key(), /*slot_id_encoded=*/true);
 
     // Add key's constructed commands to restore_cmds, send pipeline or not according to task's max_pipeline_size
@@ -724,11 +728,11 @@ StatusOr<KeyMigrationResult> SlotMigrator::migrateOneKey(const rocksdb::Slice &k
   if (auto s = metadata.Decode(bytes); !s.ok()) {
     return {Status::NotOK, s.ToString()};
   }
-
+  // 如果是非空类型但当前值为空，无需迁移。
   if (!metadata.IsEmptyableType() && metadata.size == 0) {
     return KeyMigrationResult::kUnderlyingStructEmpty;
   }
-
+  // 如果该 Key 已经过期了，也不迁移。
   if (metadata.Expired()) {
     return KeyMigrationResult::kExpired;
   }
@@ -780,27 +784,36 @@ StatusOr<KeyMigrationResult> SlotMigrator::migrateOneKey(const rocksdb::Slice &k
   return KeyMigrationResult::kMigrated;
 }
 
-Status SlotMigrator::migrateSimpleKey(const rocksdb::Slice &key, const Metadata &metadata, const std::string &bytes,
-                                      std::string *restore_cmds) {
+Status SlotMigrator::migrateSimpleKey(const rocksdb::Slice &key, const Metadata &metadata, const std::string &bytes, std::string *restore_cmds) {
   if (metadata.Type() == kRedisString) {
+    // 构建 SET key value 命令
     std::vector<std::string> command = {"SET", key.ToString(), bytes.substr(Metadata::GetOffsetAfterExpire(bytes[0]))};
+    // 如果有过期时间，添加 PXAT 参数
     if (metadata.expire > 0) {
       command.emplace_back("PXAT");
       command.emplace_back(std::to_string(metadata.expire));
     }
+    // 将命令转换为 Redis 协议格式，存入 buffer ；
+    // 例如：["SET","foo","bar"] → *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
     *restore_cmds += redis::ArrayOfBulkStrings(command);
+    // 命令计数，跟踪当前累积的命令数量，用于决定何时触发批量发送
     current_pipeline_size_++;
   } else if (metadata.Type() == kRedisJson) {
     // kRedisJson
+    // 将原始 bytes 反序列化为 JsonValue 对象，这里 FromRawString 会跳过 metadata 部分
     JsonValue json_value;
     if (auto s = redis::Json::FromRawString(bytes, &json_value); !s.ok()) {
       return {Status::NotOK, s.ToString()};
     }
+    // 将 JsonValue 对象转成标准 JSON 字符串
     auto json_bytes = GET_OR_RET(json_value.Dump());
+    // 构造 Redis 命令：JSON.SET key $ <json-string>
     std::vector<std::string> command = {"JSON.SET", key.ToString(), "$", std::move(json_bytes)};
+    // 将命令转换为 Redis 协议格式，存入 buffer
     *restore_cmds += redis::ArrayOfBulkStrings(command);
+    // 命令计数，跟踪当前累积的命令数量，用于决定何时触发批量发送
     current_pipeline_size_++;
-
+    // 如果有过期时间，附带一个 PEXPIREAT 命令，注意 metadata.expire 是绝对时间戳。
     if (metadata.expire > 0) {
       *restore_cmds += redis::ArrayOfBulkStrings({"PEXPIREAT", key.ToString(), std::to_string(metadata.expire)});
       current_pipeline_size_++;
@@ -819,13 +832,19 @@ Status SlotMigrator::migrateSimpleKey(const rocksdb::Slice &key, const Metadata 
   return Status::OK();
 }
 
+// Kvrocks 的复杂 key（list、set、zset 等）是用多个底层 RocksDB key 来表示的：
+//  - 逻辑的 redis key：存在 metadata 中
+//  - 每个元素（subkey）作为一个独立的 entry 存在 RocksDB 中，格式是 InternalKey(namespace, key, subkey, version)
+//
 Status SlotMigrator::migrateComplexKey(const rocksdb::Slice &key, const Metadata &metadata, std::string *restore_cmds) {
+  // 构造命令前缀，根据 meta.Type 确定：set -> SADD, zset -> ZADD, list -> RPUSH 等
   std::string cmd;
   {
     auto iter = type_to_cmd.find(metadata.Type());
     if (iter != type_to_cmd.end()) {
       cmd = iter->second;
     } else {
+      // 不支持的类型立即返回错误
       if (metadata.Type() > RedisTypeNames.size()) {
         return {Status::NotOK, "unknown key type: " + std::to_string(metadata.Type())};
       }
@@ -833,19 +852,24 @@ Status SlotMigrator::migrateComplexKey(const rocksdb::Slice &key, const Metadata
     }
   }
 
+  // 用户原始命令，其操作的是用户的原始 key ，不是 rocksdb 的存储 key
   std::vector<std::string> user_cmd = {cmd, key.ToString()};
+
   // Construct key prefix to iterate values of the complex type user key
+  // 基于 key 构造 RocksDB 底层存储的 internal key 前缀，用于扫描该键的所有元素
   std::string slot_key = AppendNamespacePrefix(key);
   std::string prefix_subkey = InternalKey(slot_key, "", metadata.version, true).Encode();
+
+  // 构造 RocksDB 迭代器（扫描子键）
   rocksdb::ReadOptions read_options = storage_->DefaultScanOptions();
   read_options.snapshot = slot_snapshot_;
   Slice prefix_slice(prefix_subkey);
   read_options.iterate_lower_bound = &prefix_slice;
   // Should use th raw db iterator to avoid reading uncommitted writes in transaction mode
   auto iter = util::UniqueIterator(storage_->GetDB()->NewIterator(read_options));
-
   int item_count = 0;
 
+  // 遍历 RocksDB 中该 key 所有的子项
   for (iter->Seek(prefix_subkey); iter->Valid(); iter->Next()) {
     if (stop_migration_) {
       return {Status::NotOK, std::string(errMigrationTaskCanceled)};
@@ -857,9 +881,13 @@ Status SlotMigrator::migrateComplexKey(const rocksdb::Slice &key, const Metadata
 
     // Parse values of the complex key
     // InternalKey is adopted to get complex key's value from the formatted key return by iterator of rocksdb
+    //
+    // 使用 InternalKey 解析出 sub_key
     InternalKey inkey(iter->key(), true);
+    // 不同类型，用不同方式组装参数
     switch (metadata.Type()) {
       case kRedisSet: {
+        // SADD key subkey1 subkey2
         user_cmd.emplace_back(inkey.GetSubKey().ToString());
         break;
       }
@@ -869,6 +897,7 @@ Status SlotMigrator::migrateComplexKey(const rocksdb::Slice &key, const Metadata
         break;
       }
       case kRedisZSet: {
+        // ZADD key score1 member1 score2 member2
         auto score = DecodeDouble(iter->value().ToString().data());
         user_cmd.emplace_back(util::Float2String(score));
         user_cmd.emplace_back(inkey.GetSubKey().ToString());
@@ -882,11 +911,13 @@ Status SlotMigrator::migrateComplexKey(const rocksdb::Slice &key, const Metadata
         break;
       }
       case kRedisHash: {
+        // HMSET key field1 val1 field2 val2
         user_cmd.emplace_back(inkey.GetSubKey().ToString());
         user_cmd.emplace_back(iter->value().ToString());
         break;
       }
       case kRedisList: {
+        // RPUSH key item1 item2
         user_cmd.emplace_back(iter->value().ToString());
         break;
       }
@@ -902,10 +933,12 @@ Status SlotMigrator::migrateComplexKey(const rocksdb::Slice &key, const Metadata
     if (metadata.Type() != kRedisBitmap) {
       item_count++;
       if (item_count >= kMaxItemsInCommand) {
+        // 每次到达批量阈值（比如 1024），将命令加到 restore_cmds 中。
         *restore_cmds += redis::ArrayOfBulkStrings(user_cmd);
         current_pipeline_size_++;
         item_count = 0;
         // Have to clear saved items
+        // 清空 user_cmd 的参数部分（保留前两个元素：命令名和 key），准备下次拼接。
         user_cmd.erase(user_cmd.begin() + 2, user_cmd.end());
 
         // Send commands if the pipeline contains enough of them
@@ -922,19 +955,25 @@ Status SlotMigrator::migrateComplexKey(const rocksdb::Slice &key, const Metadata
             fmt::format("failed to iterate values of the complex key {}: {}", key.ToString(), s.ToString())};
   }
 
+
+  // 处理最后一批不满的子项...
+
   // Have to check the item count of the last command list
+  // 每次到达批量阈值（比如 1024），将命令加到 restore_cmds 中。
   if (item_count % kMaxItemsInCommand != 0) {
     *restore_cmds += redis::ArrayOfBulkStrings(user_cmd);
     current_pipeline_size_++;
   }
 
   // Add TTL for complex key
+  // 加上过期时间
   if (metadata.expire > 0) {
     *restore_cmds += redis::ArrayOfBulkStrings({"PEXPIREAT", key.ToString(), std::to_string(metadata.expire)});
     current_pipeline_size_++;
   }
 
   // Send commands if the pipeline contains enough of them
+  // 根据当前 pipeline 是否达到了阈值，判断是否需要发送。
   auto s = sendCmdsPipelineIfNeed(restore_cmds, false);
   if (!s.IsOK()) {
     return s.Prefixed(errFailedToSendCommands);
