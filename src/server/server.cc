@@ -177,9 +177,13 @@ Status Server::Start() {
   }
 
   if (config_->cluster_enabled) {
+    // 集群模式下，为 server 创建一个 migrator ，全局只有一个。
+
     // Create objects used for slot migration
+    // 创建 migrator 对象
     slot_migrator = std::make_unique<SlotMigrator>(this);
 
+    // 从配置文件中加载集群信息
     if (config_->persist_cluster_nodes_enabled) {
       auto s = cluster->LoadClusterNodes(config_->NodesFilePath());
       if (!s.IsOK()) {
@@ -187,11 +191,13 @@ Status Server::Start() {
       }
     }
 
+    // 创建 migrator 对象的后台迁移线程，它监听信号量处理迁移任务
     auto s = slot_migrator->CreateMigrationThread();
     if (!s.IsOK()) {
       return s.Prefixed("failed to create migration thread");
     }
 
+    // 创建 import 对象
     slot_import = std::make_unique<SlotImport>(this);
   }
 

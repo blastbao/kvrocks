@@ -215,7 +215,7 @@ class SlotMigrator : public redis::Database {
   std::thread t_;
   std::mutex job_mutex_;
   std::condition_variable job_cv_;
-  std::unique_ptr<SlotMigrationJob> migration_job_;  // GUARDED_BY(job_mutex_)
+  std::unique_ptr<SlotMigrationJob> migration_job_;  // 当前正在处理的迁移任务，迁移完成后被 reset // GUARDED_BY(job_mutex_)
 
   std::string dst_node_;
   std::string dst_ip_;
@@ -237,5 +237,5 @@ class SlotMigrator : public redis::Database {
   uint64_t wal_begin_seq_ = 0;
 
   std::mutex blocking_mutex_;
-  SyncMigrateContext *blocking_context_ = nullptr;
+  SyncMigrateContext *blocking_context_ = nullptr; // 当前正在处理的迁移任务的 blocking_ctx_ ，当迁移完成后，在 reset migration_job_ 前，会触发 blocking_context_ 并 reset 
 };

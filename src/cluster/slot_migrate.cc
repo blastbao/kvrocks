@@ -168,7 +168,9 @@ Status SlotMigrator::CreateMigrationThread() {
 }
 
 void SlotMigrator::loop() {
+  // 同时只有一个迁移任务在执行，它保存在 migration_job_ 变量上
   while (true) {
+    // 监听信号量（配合 mutex 使用），被唤醒意味着有新迁移任务到达
     {
       std::unique_lock<std::mutex> ul(job_mutex_);
       job_cv_.wait(ul, [&] { return isTerminated() || migration_job_; });
@@ -178,6 +180,7 @@ void SlotMigrator::loop() {
       clean();
       return;
     }
+
     info("[migrate] Migrating slot(s): {}, dst_ip: {}, dst_port: {}, max_speed: {}, max_pipeline_size: {}",
          migration_job_->slot_range.String(),
          migration_job_->dst_ip,
@@ -185,12 +188,14 @@ void SlotMigrator::loop() {
          migration_job_->max_speed,
          migration_job_->max_pipeline_size);
 
+    // 有新的迁移任务 migration_job_ 待执行，解析相关参数
     dst_ip_ = migration_job_->dst_ip;
     dst_port_ = migration_job_->dst_port;
     max_migration_speed_ = migration_job_->max_speed;
     max_pipeline_size_ = migration_job_->max_pipeline_size;
     seq_gap_limit_ = migration_job_->seq_gap_limit;
 
+    // 执行迁移任务
     runMigrationProcess();
   }
 }
@@ -198,9 +203,9 @@ void SlotMigrator::loop() {
 void SlotMigrator::runMigrationProcess() {
   // 迁移开始
   current_stage_ = SlotMigrationStage::kStart;
-  // 不断循环直到线程终止
+  // 不断循环直到迁移完成（成功 or 失败）
   while (true) {
-    if (isTerminated()) {
+    if (isTerminated()) { // 线程被终止
       warn("[migrate] Will stop state machine, because the thread was terminated");
       clean();
       return;
@@ -1402,7 +1407,6 @@ void SlotMigrator::resumeSyncCtx(const Status &migrate_result) {
   std::unique_lock<std::mutex> lock(blocking_mutex_);
   if (blocking_context_) {
     blocking_context_->Resume(migrate_result); // [重要] 通知迁移已经完成
-
     blocking_context_ = nullptr;
   }
 }

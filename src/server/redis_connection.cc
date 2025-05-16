@@ -195,7 +195,7 @@ bool Connection::IsFlagEnabled(Flag flag) const { return (flags_ & flag) > 0; }
 
 bool Connection::CanMigrate() const {
   return !is_running_                                                    // reading or writing
-         && !IsFlagEnabled(redis::Connection::kCloseAfterReply)          // close after reply
+         && !IsFlagEnabled(redis::Connection::kCloseAfterReply)     // close after reply
          && saved_current_command_ == nullptr                            // not executing blocking command like BLPOP
          && subscribe_channels_.empty() && subscribe_patterns_.empty();  // not subscribing any channel
 }
