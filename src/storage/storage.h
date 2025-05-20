@@ -376,14 +376,28 @@ class Storage {
   // is_txn_mode_ is used to determine whether the current Storage is in transactional mode,
   // .i.e, in "EXEC" command(CommandExec).
   std::atomic<bool> is_txn_mode_ = false;
+
+
+
   // txn_write_batch_ is used as the global write batch for the transaction mode,
   // all writes will be grouped in this write batch when entering the transaction mode,
   // then write it at once when committing.
   //
   // Notice: the reason why we can use the global transaction? because the EXEC is an exclusive
   // command, so it won't have multi transactions to be executed at the same time.
+  //
+  //
+  // 事务模式（如 Redis 的 MULTI）下，所有写操作（如 SET/DEL）不会立即写入数据库，而是暂存到 txn_write_batch_ 中。
+  // 提交时（如 EXEC），整个 txn_write_batch_ 一次性写入 RocksDB，保证原子性。
+  //
+  // WriteBatchWithIndex 是 RocksDB 提供的带索引的批处理结构，允许：
+  //  - 在事务中读取自己的修改（如 GET 操作能看到本事务中 SET 的值）。
+  //  - 高效合并写操作（避免重复键的冗余存储）。
+  //
+  // KVRocks 继承 Redis 的语义，事务命令（MULTI/EXEC）是 排他性 的。
+  //  - 同一时间只有一个事务能执行，无需处理并发冲突。
+  // 因此，全局唯一的 txn_write_batch_ 是线程安全的。
   std::unique_ptr<rocksdb::WriteBatchWithIndex> txn_write_batch_;
-
   rocksdb::WriteOptions default_write_opts_;
 
   // rocksdb used global block cache

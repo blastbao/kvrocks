@@ -676,27 +676,36 @@ rocksdb::Iterator *Storage::NewIterator(engine::Context &ctx, const rocksdb::Rea
   return iter;
 }
 
-void Storage::MultiGet(engine::Context &ctx,
-                       const rocksdb::ReadOptions &options,
-                       rocksdb::ColumnFamilyHandle *column_family,
-                       const size_t num_keys,
-                       const rocksdb::Slice *keys,
-                       rocksdb::PinnableSlice *values,
-                       rocksdb::Status *statuses) {
+// 批量读取多个 key 的值：支持普通模式和事务模式下的批量读取。
+void Storage::MultiGet(engine::Context &ctx,                          // Kvrocks 上下文
+                       const rocksdb::ReadOptions &options,           // 读取配置
+                       rocksdb::ColumnFamilyHandle *column_family,    // 列族
+                       const size_t num_keys,                         // 读取的 key 数量
+                       const rocksdb::Slice *keys,                    // 读取的 key 数组
+                       rocksdb::PinnableSlice *values,                // 接收返回值列表
+                       rocksdb::Status *statuses) {                   // 每个 key 对应的返回状态
 
+  // 事务一致性校验
+  // 如果启用事务上下文（比如在 Lua 脚本或事务块里），要求 options.snapshot 必须存在；
+  // 并且上下文 ctx.snapshot 和 options.snapshot 的快照序列号必须一致，避免脏读。
   if (ctx.txn_context_enabled) {
     CHECK(options.snapshot != nullptr);
     CHECK(ctx.GetSnapshot()->GetSequenceNumber() == options.snapshot->GetSequenceNumber());
   }
+
   if (is_txn_mode_ && txn_write_batch_->GetWriteBatch()->Count() > 0) {
-    txn_write_batch_->MultiGetFromBatchAndDB(db_.get(), options, column_family, num_keys, keys, values, statuses,
-                                             false);
+    // 如果 Storage 当前是事务模式，且当前批次(txn_write_batch_)中有未提交写入数据，就先从 WriteBatch 中读取（未写入 DB 的临时数据），然后再从 DB 中读取；
+    // 这样，能够读到尚未提交的写数据；
+    txn_write_batch_->MultiGetFromBatchAndDB(db_.get(), options, column_family, num_keys, keys, values, statuses,false);
   } else if (ctx.txn_context_enabled && ctx.batch) {
+    // 如果不是全局事务模式，而是上下文层面启用了事务（如 Lua 脚本执行），并且当前 ctx 中有未提交的写入(ctx.batch) ，就先从 ctx 的WriteBatch 中读取（未写入 DB 的临时数据），然后再从 DB 中读取；
     ctx.batch->MultiGetFromBatchAndDB(db_.get(), options, column_family, num_keys, keys, values, statuses, false);
   } else {
+    // 非事务，直接从 DB 读取
     db_->MultiGet(options, column_family, num_keys, keys, values, statuses, false);
   }
 
+  // 统计
   for (size_t i = 0; i < num_keys; i++) {
     recordKeyspaceStat(column_family, statuses[i]);
   }
@@ -950,17 +959,21 @@ void Storage::SetIORateLimit(int64_t max_io_mb) {
 rocksdb::DB *Storage::GetDB() { return db_.get(); }
 
 Status Storage::BeginTxn() {
+  // 检查是否已处于事务模式
   if (is_txn_mode_) {
     return Status{Status::NotOK, "cannot begin a new transaction while already in transaction mode"};
   }
+
   // The EXEC command is exclusive and shouldn't have multi transaction at the same time,
   // so it's fine to reset the global write batch without any lock.
   is_txn_mode_ = true;
   // Set overwrite_key to false to avoid overwriting the existing key in case
   // like downstream would parse the replication log etc.
   txn_write_batch_ = std::make_unique<rocksdb::WriteBatchWithIndex>(
-      /*backup_index_comparator=*/rocksdb::BytewiseComparator(),
-      /*reserved_bytes=*/0, /*overwrite_key=*/false, /*max_bytes=*/GetWriteBatchMaxBytes());
+      /*backup_index_comparator=*/rocksdb::BytewiseComparator(),  // 基于字节序排序
+      /*reserved_bytes=*/0,                                       //
+      /*overwrite_key=*/false,                                    //
+      /*max_bytes=*/GetWriteBatchMaxBytes());                     // 内存占用
   return Status::OK();
 }
 
@@ -1219,7 +1232,9 @@ int Storage::ReplDataManager::OpenDataFile(Storage *storage, const std::string &
   return rv;
 }
 
-Status Storage::ReplDataManager::ParseMetaAndSave(Storage *storage, rocksdb::BackupID meta_id, evbuffer *evbuf,
+Status Storage::ReplDataManager::ParseMetaAndSave(Storage *storage,
+                                                  rocksdb::BackupID meta_id,
+                                                  evbuffer *evbuf,
                                                   Storage::ReplDataManager::MetaInfo *meta) {
   auto meta_file = "meta/" + std::to_string(meta_id);
   debug("[meta] id: {}", meta_id);

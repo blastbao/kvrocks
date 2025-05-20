@@ -186,16 +186,21 @@ rocksdb::Status String::Get(engine::Context &ctx, const std::string &user_key, s
   return getValue(ctx, ns_key, value);
 }
 
+// GETEX key EX seconds
+//
+// 在读取 key 的 value 同时设置 expire
 rocksdb::Status String::GetEx(engine::Context &ctx,
                               const std::string &user_key,
                               std::string *value,
                               std::optional<uint64_t> expire) {
-
+  // 构造 key
   std::string ns_key = AppendNamespacePrefix(user_key);
 
+  // 获取 value
   rocksdb::Status s = getValue(ctx, ns_key, value);
   if (!s.ok()) return s;
 
+  // 构造 meta ，更新 expire
   std::string raw_data;
   Metadata metadata(kRedisString, false);
   if (expire.has_value()) {
@@ -204,14 +209,20 @@ rocksdb::Status String::GetEx(engine::Context &ctx,
     // If there is no ttl or persist is false, then skip the following updates.
     return rocksdb::Status::OK();
   }
+
+  // 构造新的 raw data ：metadata 放前面，后面跟真实 value
   metadata.Encode(&raw_data);
   raw_data.append(value->data(), value->size());
+
+  // 构造 write batch
   auto batch = storage_->GetWriteBatchBase();
-  WriteBatchLogData log_data(kRedisString);
-  s = batch->PutLogData(log_data.Encode());
+  WriteBatchLogData log_data(kRedisString); // 标记这是一个 Redis String 类型的数据写入
+  s = batch->PutLogData(log_data.Encode()); // 把附加信息记录到 wal log entry 中
   if (!s.ok()) return s;
   s = batch->Put(metadata_cf_handle_, ns_key, raw_data);
   if (!s.ok()) return s;
+
+  // 写入 RocksDB
   s = storage_->Write(ctx, storage_->DefaultWriteOptions(), batch->GetWriteBatch());
   if (!s.ok()) return s;
   return rocksdb::Status::OK();
