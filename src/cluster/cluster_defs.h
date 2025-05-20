@@ -28,7 +28,7 @@ enum {
   kClusterSlave = 2,
   kClusterNodeIdLen = 40,
   kClusterPortIncr = 10000,
-  kClusterSlots = HASH_SLOTS_SIZE,
+  kClusterSlots = HASH_SLOTS_SIZE, // 共 16384 个 slots
 };
 
 inline constexpr const char *errInvalidNodeID = "Invalid cluster node id";

@@ -28,8 +28,19 @@ SlotImport::SlotImport(Server *srv)
   metadata_cf_handle_ = nullptr;
 }
 
+// 在分布式 Key-Value 存储系统中（如 Redis Cluster、Kvrocks），key 会按哈希分布到若干 slot 中，slot 是数据分片的最小单位。
+//
+// Slot 导入（import）流程通常是指：
+//  - 某个节点正在接收来自其他节点的数据迁移（迁入）。
+//  - 在接收数据之前，应清空已有该 slot 的旧数据。
+//  - 同一时间只能导入一个 slot-range，以避免数据混乱或冲突。
 Status SlotImport::Start(const SlotRange &slot_range) {
+  // 对 import_status_、import_slot_range_ 的访问需要加锁
   std::lock_guard<std::mutex> guard(mutex_);
+
+  // 如果当前已经有导入任务在进行
+  //  - 若是相同 slot_range，再次调用 Start 会直接返回 OK（幂等性）。
+  //  - 若是不同 slot_range，则拒绝导入，报错表明当前已有其他导入任务在进行。
   if (import_status_ == kImportStart) {
     // return ok if the same slot is importing
     if (import_slot_range_ == slot_range) {
@@ -39,12 +50,14 @@ Status SlotImport::Start(const SlotRange &slot_range) {
   }
 
   // Clean slot data first
+  // 把当前节点上该 slot_range 的旧数据全部删除，保证后续导入过程中数据不会冲突或重复。
   engine::Context ctx(srv_->storage);
   auto s = ClearKeysOfSlotRange(ctx, namespace_, slot_range);
   if (!s.ok()) {
     return {Status::NotOK, fmt::format("clear keys of slot(s) error: {}", s.ToString())};
   }
 
+  // 设置导入状态和 slot 范围
   import_status_ = kImportStart;
   import_slot_range_ = slot_range;
   return Status::OK();
@@ -85,8 +98,11 @@ Status SlotImport::Fail(const SlotRange &slot_range) {
 }
 
 Status SlotImport::StopForLinkError() {
+  // 对 import_status_/namespace_/import_slot_range_ 等变量的访问要加锁
   std::lock_guard<std::mutex> guard(mutex_);
+
   // We don't need to do anything if the importer is not started yet.
+  // 如果当前没有导入任务，直接返回 OK
   if (import_status_ != kImportStart) return Status::OK();
 
   // Maybe server has failovered
@@ -98,6 +114,8 @@ Status SlotImport::StopForLinkError() {
   // 4. ClearKeysOfSlot can clear data although server is a slave, because ClearKeysOfSlot
   //    deletes data in rocksdb directly. Therefore, it is necessary to avoid clearing data gotten
   //    from new master.
+  //
+  // 在当前节点还是主节点时，才清除数据，防止误删主从同步来的数据。
   if (!srv_->IsSlave()) {
     // Clean imported slot data
     engine::Context ctx(srv_->storage);
@@ -107,6 +125,7 @@ Status SlotImport::StopForLinkError() {
     }
   }
 
+  // 设置导入失败状态
   import_status_ = kImportFailed;
   return Status::OK();
 }

@@ -136,38 +136,47 @@ StatusOr<std::vector<std::string>> LookupHostByName(const std::string &host) {
 }
 
 StatusOr<int> SockConnect(const std::string &host, uint32_t port, int conn_timeout, int timeout) {
+
+  // 1. DNS 解析
   addrinfo hints = {}, *servinfo = nullptr;
+  hints.ai_family = AF_UNSPEC;              // 支持 IPv4/IPv6
+  hints.ai_socktype = SOCK_STREAM;          // TCP
 
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-
+  // 根据 host、port、hints 解析域名，得到一串 addrinfo 链表（可能包含 IPv4、IPv6）
   if (int rv = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &servinfo); rv != 0) {
     return {Status::NotOK, gai_strerror(rv)};
   }
-
+  // 使用 MakeScopeExit（RAII）确保最后释放 servinfo
   auto exit = MakeScopeExit([servinfo] { freeaddrinfo(servinfo); });
 
+  // 2. 遍历解析到的地址，逐个尝试连接
   for (auto p = servinfo; p != nullptr; p = p->ai_next) {
+    // 将 socket 封装在 UniqueFD 中，UniqueFD 是自定义封装的 RAII 智能句柄类型，避免 fd 泄漏。
     auto cfd = UniqueFD(socket(p->ai_family, p->ai_socktype, p->ai_protocol));
     if (!cfd) continue;
 
+    // 如果 conn_timeout == 0，直接调用阻塞 connect 。
     if (conn_timeout == 0) {
       if (connect(*cfd, p->ai_addr, p->ai_addrlen) == -1) {
         continue;
       }
     } else {
+      // 执行非阻塞 connect
       fcntl(*cfd, F_SETFL, O_NONBLOCK);
       int ret = connect(*cfd, p->ai_addr, p->ai_addrlen);
-      if (ret != 0 && errno != EINPROGRESS) {
+      if (ret != 0 && errno != EINPROGRESS) { // 非阻塞模式下返回 EINPROGRESS 是正常的
         continue;
       }
 
+      // 使用 AeWait(*cfd, AE_WRITABLE, conn_timeout) 检测连接是否完成，AeWait 是类似 epoll/poll 的封装函数，用于等待 fd 的某种状态（这里是写就绪）
       auto retmask = util::AeWait(*cfd, AE_WRITABLE, conn_timeout);
+      // 如果连接失败或异常（如远端关闭），立即返回错误
       if ((retmask & AE_WRITABLE) == 0 || (retmask & AE_ERROR) != 0 || (retmask & AE_HUP) != 0) {
         return Status::FromErrno();
       }
 
       // restore to the block mode
+      // 成功连接后，恢复成阻塞模式，避免影响后续读写逻辑
       int socket_arg = 0;
       if (socket_arg = fcntl(*cfd, F_GETFL, NULL); socket_arg < 0) {
         return Status::FromErrno();
@@ -434,8 +443,11 @@ std::vector<std::string> GetLocalIPAddresses() {
   return ip_addresses;
 }
 
+// C++17 允许非类型模板参数 为 auto ，这里把函数 write/pwrite/... 当成模板实参传进来。
 template <auto syscall, typename FD, typename... Args>
 Status WriteImpl(FD fd, std::string_view data, Args &&...args) {
+  // Linux/Unix write 系统调用一次并不保证写满请求的字节数（尤其是 socket、管道或设置了 O_NONBLOCK 的文件）。
+  // WriteImpl 用一个 while 循环，直到成功写完 data 中的全部字节才返回 OK。
   ssize_t n = 0;
   while (n < static_cast<ssize_t>(data.size())) {
     ssize_t nwritten = syscall(fd, data.data() + n, data.size() - n, std::forward<Args>(args)...);

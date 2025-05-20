@@ -134,7 +134,7 @@ class CommandFlushDB : public Commander {
   Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     if (srv->GetConfig()->cluster_enabled) {
       if (srv->slot_migrator->IsMigrationInProgress()) {
-        srv->slot_migrator->SetStopMigrationFlag(true);
+        srv->slot_migrator->SetStopMigrationFlag(true); // ???
         info("Stop migration task for flushdb");
       }
     }

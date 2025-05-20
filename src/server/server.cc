@@ -151,6 +151,11 @@ Server::~Server() {
 //   threads when full sync, TODO(@shooterit) we should manage this threads uniformly.
 //     - feed-replica-data-info: generate checkpoint and send files list when full sync
 //     - feed-replica-file: send SST files when slaves ask for full sync
+//
+//
+//
+//
+//
 Status Server::Start() {
   auto s = namespace_.LoadAndRewrite();
   if (!s.IsOK()) {
@@ -177,7 +182,7 @@ Status Server::Start() {
   }
 
   if (config_->cluster_enabled) {
-    // 集群模式下，为 server 创建一个 migrator ，全局只有一个。
+    // 集群模式下，为 server 创建一个 migrator ，全局只有一个，其有一个后台线程用于执行数据迁移，来支持集群扩、缩容。
 
     // Create objects used for slot migration
     // 创建 migrator 对象
@@ -1389,7 +1394,7 @@ bool Server::PrepareRestoreDB() {
 void Server::WaitNoMigrateProcessing() {
   if (config_->cluster_enabled) {
     info("[server] Waiting until no migration task is running...");
-    slot_migrator->SetStopMigrationFlag(true);
+    slot_migrator->SetStopMigrationFlag(true); // ???
     while (slot_migrator->GetCurrentSlotMigrationStage() != SlotMigrationStage::kNone) {
       usleep(500);
     }

@@ -81,7 +81,9 @@ SlotMigrator::SlotMigrator(Server *srv)
   }
 }
 
-// 在当前节点启动一个 slot 迁移任务，并将其委托给后台迁移线程异步执行
+// 当 client 发送迁移命令 CLUSTERX MIGRATE 给 rocksdb 时，会调用此函数：
+//  创建一个迁移任务 SlotMigrationJob 对象，将其保存到成员变量 migration_job_ 上（锁），然后触发信号量 job_cv_ 通知后台线程执行数据迁移。
+//  创建、保存、触发迁移任务后，此函数即刻返回，如果 client 需要阻塞等待迁移完成，需要通过 blocking_ctx 轮训或者阻塞式等待迁移结果。
 Status SlotMigrator::PerformSlotRangeMigration(const std::string &node_id,      // 目标节点 ID
                                                std::string &dst_ip,             // 目标节点 IP
                                                int dst_port,                    // 目标节点 PORT
@@ -149,10 +151,10 @@ Status SlotMigrator::PerformSlotRangeMigration(const std::string &node_id,      
 
 SlotMigrator::~SlotMigrator() {
   if (thread_state_ == ThreadState::Running) {
-    stop_migration_ = true;
-    thread_state_ = ThreadState::Terminated;
-    job_cv_.notify_all();
-    if (auto s = util::ThreadJoin(t_); !s) {
+    stop_migration_ = true;                             // 当前迁移任务被中止
+    thread_state_ = ThreadState::Terminated;            // 当前迁移线程被终止
+    job_cv_.notify_all();                               // 唤醒迁移线程让其退出
+    if (auto s = util::ThreadJoin(t_); !s) {  // 等待迁移线程退出
       warn("Slot migrating thread operation failed: {}", s.Msg());
     }
   }
@@ -167,6 +169,8 @@ Status SlotMigrator::CreateMigrationThread() {
   return Status::OK();
 }
 
+// 后台线程主循环：
+//  监听信号量 job_cv_ ，当 job_cv_ 被触发意味着 migration_job_ 变量上保存了当前待处理的迁移任务。
 void SlotMigrator::loop() {
   // 同时只有一个迁移任务在执行，它保存在 migration_job_ 变量上
   while (true) {
@@ -473,7 +477,7 @@ Status SlotMigrator::syncWALByCmd() {
     return s.Prefixed("failed to sync WAL before forbidding a slot");
   }
 
-  // 对正在迁移的 slot_range 加锁
+  // 对正在迁移的 slot_range_ 加锁
   setForbiddenSlotRange(slot_range_);
 
   // Send last incremental data

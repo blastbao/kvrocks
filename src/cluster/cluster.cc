@@ -280,6 +280,7 @@ Status Cluster::SetMasterSlaveRepl() {
   if (!srv_) return Status::OK();
 
   // If the node is not in the cluster topology, remove the master replication if it's a replica.
+  // 如果 myself_ 不存在，说明此节点尚未加入集群，如果之前是 Slave，则需要移除主从关系
   if (!myself_) {
     if (auto s = srv_->RemoveMaster(); !s.IsOK()) {
       return s.Prefixed("failed to remove master");
@@ -287,9 +288,10 @@ Status Cluster::SetMasterSlaveRepl() {
     return Status::OK();
   }
 
-  bool is_slave = srv_->IsSlave();
-  bool is_cluster_enabled = srv_->GetConfig()->cluster_enabled;
+  bool is_slave = srv_->IsSlave();                              // 当前节点是否是 Slave
+  bool is_cluster_enabled = srv_->GetConfig()->cluster_enabled; // 集群模式是否启用
 
+  // 如果当前节点在集群拓扑中是 Master
   if (myself_->role == kClusterMaster) {
     // Master mode
     auto s = srv_->RemoveMaster();
@@ -297,6 +299,7 @@ Status Cluster::SetMasterSlaveRepl() {
       return s.Prefixed("failed to remove master");
     }
     info("MASTER MODE enabled by cluster topology setting");
+    // ???
     if (srv_->slot_migrator && is_cluster_enabled && is_slave) {
       // Slave -> Master
       srv_->slot_migrator->SetStopMigrationFlag(false);
@@ -305,9 +308,14 @@ Status Cluster::SetMasterSlaveRepl() {
     return Status::OK();
   }
 
+  // 如果当前节点在集群拓扑中是 Slave
+
+  // 查找当前节点归属的 Master 节点
   auto it = nodes_.find(myself_->master_id);
+  // 找到 Master 节点
   if (it != nodes_.end()) {
     // Replica mode and master node is existing
+    // 建立主从复制关系
     std::shared_ptr<ClusterNode> master = it->second;
     auto s = srv_->AddMaster(master->host, master->port, false);
     if (!s.IsOK()) {
@@ -315,6 +323,7 @@ Status Cluster::SetMasterSlaveRepl() {
            s.Msg());
       return s.Prefixed("failed to add master");
     }
+    // ???
     if (srv_->slot_migrator && is_cluster_enabled && !is_slave) {
       // Master -> Slave
       srv_->slot_migrator->SetStopMigrationFlag(true);
@@ -420,7 +429,7 @@ Status Cluster::ImportSlotRange(redis::Connection *conn, const SlotRange &slot_r
   if (!slot_range.IsValid()) {
     return {Status::NotOK, errSlotRangeInvalid};
   }
-  // 不能导入已经属于本节点的 slot
+  // 不能导入已经属于本节点的 slot ，否则可能导致数据覆盖。
   for (auto slot = slot_range.start; slot <= slot_range.end; slot++) {
     auto source_node = srv_->cluster->slots_nodes_[slot];
     if (source_node && source_node->id == myid_) {
@@ -432,15 +441,15 @@ Status Cluster::ImportSlotRange(redis::Connection *conn, const SlotRange &slot_r
   Status s;
   switch (state) {
     case kImportStart: // 开始导入
-
-      s = srv_->slot_import->Start(slot_range);
+      s = srv_->slot_import->Start(slot_range);   // 设置状态、清理数据
       if (!s.IsOK()) return s;
 
       // Set link importing
-      conn->SetImporting();
-      myself_->importing_slot_range = slot_range;
+      conn->SetImporting();                       // 给连接打上 Importing 标记
+      myself_->importing_slot_range = slot_range; // 记录正在导入的 slot 范围
 
       // Set link error callback
+      // 设置连接关闭回调（异常清理）
       conn->close_cb = [object_ptr = srv_->slot_import.get(), slot_range]([[maybe_unused]] int fd) {
         auto s = object_ptr->StopForLinkError();
         if (!s.IsOK()) {
@@ -449,6 +458,7 @@ Status Cluster::ImportSlotRange(redis::Connection *conn, const SlotRange &slot_r
       };
 
       // Stop forbidding writing slot to accept write commands
+      // ???
       if (slot_range.HasOverlap(srv_->slot_migrator->GetForbiddenSlotRange())) {
         // This approach assumes a shard only handles one migration task at a time.
         // When executing the import logic, the absence of other outgoing migrations on this shard justifies safely
@@ -459,12 +469,12 @@ Status Cluster::ImportSlotRange(redis::Connection *conn, const SlotRange &slot_r
 
       info("[import] Start importing slot(s) {}", slot_range.String());
       break;
-    case kImportSuccess:
+    case kImportSuccess:  // 导入完成
       s = srv_->slot_import->Success(slot_range);
       if (!s.IsOK()) return s;
       info("[import] Mark the importing slot(s) {} as succeed", slot_range.String());
       break;
-    case kImportFailed:
+    case kImportFailed:   // 导入失败
       s = srv_->slot_import->Fail(slot_range);
       if (!s.IsOK()) return s;
       info("[import] Mark the importing slot(s) {} as failed", slot_range.String());

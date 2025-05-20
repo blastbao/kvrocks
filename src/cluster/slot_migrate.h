@@ -214,8 +214,8 @@ class SlotMigrator : public redis::Database {
 
   std::thread t_;
   std::mutex job_mutex_;
-  std::condition_variable job_cv_;
-  std::unique_ptr<SlotMigrationJob> migration_job_;  // 当前正在处理的迁移任务，迁移完成后被 reset // GUARDED_BY(job_mutex_)
+  std::condition_variable job_cv_;                   // 当有新任务到达时，将其保存到 migration_job_ 后通过 job_cv_ 唤醒迁移线程处理任务
+  std::unique_ptr<SlotMigrationJob> migration_job_;  // 当前正在处理的迁移任务，迁移完成后被置空 // GUARDED_BY(job_mutex_)
 
   std::string dst_node_;
   std::string dst_ip_;
@@ -229,13 +229,20 @@ class SlotMigrator : public redis::Database {
   // 此变量作用：在迁移 slot 的最后阶段（增量同步完成后、开始切换拓扑前），临时禁止对该 slot 的写操作，确保迁移结束前数据不会再变动，保证数据一致性。
   // Q: 在迁移成功后，为什么 forbidden_slot_range_ 变量没有被重置？
   std::atomic<SlotRange> forbidden_slot_range_ = SlotRange{-1, -1};
-  std::atomic<SlotRange> slot_range_ = SlotRange{-1, -1};
-  std::atomic<SlotRange> migrate_failed_slot_range_ = SlotRange{-1, -1};
+  std::atomic<SlotRange> slot_range_ = SlotRange{-1, -1};                   // 如果 slot_range_ 非空，意味着当前有迁移任务在进行
+  std::atomic<SlotRange> migrate_failed_slot_range_ = SlotRange{-1, -1};    // 如果 slot_range_ 迁移失败，会将 slot_range_ 保存到 migrate_failed_slot_range_
 
+  // 如果设置了此标记，所有迁移相关的函数都会在检查点中止并报错返回，最终传导到后台迁移线程的 loop 函数；
+  // 在 loop 函数中，当前迁移任务被停止导致 runMigrationProcess 函数退出，然后 loop 继续阻塞在条件变量上等待下一个任务到达。
+  //
+  // 所以，stop_migration_ 被置为 true ，则所有正在进行的迁移任务会在检查点退出、新启动的任务也会立即退出，来实现禁用迁移的能力；
+  // 当 stop_migration_ 被置为 false 后，才能接受新到达的任务。
   std::atomic<bool> stop_migration_ = false;  // if is true migration will be stopped but the thread won't be destroyed
-  const rocksdb::Snapshot *slot_snapshot_ = nullptr;
-  uint64_t wal_begin_seq_ = 0;
+
+
+  const rocksdb::Snapshot *slot_snapshot_ = nullptr;  // 迁移需要先发送 snapshot 给目标节点，这里用来保存当时的 RocksDB Snapshot
+  uint64_t wal_begin_seq_ = 0;                        // 发送 snapshot 后，需要从当时 seq no 开始同步 wal ，这里用来保存 wal 位点
 
   std::mutex blocking_mutex_;
-  SyncMigrateContext *blocking_context_ = nullptr; // 当前正在处理的迁移任务的 blocking_ctx_ ，当迁移完成后，在 reset migration_job_ 前，会触发 blocking_context_ 并 reset 
+  SyncMigrateContext *blocking_context_ = nullptr; // 当前正在处理的迁移任务的 blocking_ctx_ ，当迁移完成后，在 reset migration_job_ 前，会触发 blocking_context_ 并 reset
 };
