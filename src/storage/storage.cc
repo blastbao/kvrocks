@@ -676,9 +676,14 @@ rocksdb::Iterator *Storage::NewIterator(engine::Context &ctx, const rocksdb::Rea
   return iter;
 }
 
-void Storage::MultiGet(engine::Context &ctx, const rocksdb::ReadOptions &options,
-                       rocksdb::ColumnFamilyHandle *column_family, const size_t num_keys, const rocksdb::Slice *keys,
-                       rocksdb::PinnableSlice *values, rocksdb::Status *statuses) {
+void Storage::MultiGet(engine::Context &ctx,
+                       const rocksdb::ReadOptions &options,
+                       rocksdb::ColumnFamilyHandle *column_family,
+                       const size_t num_keys,
+                       const rocksdb::Slice *keys,
+                       rocksdb::PinnableSlice *values,
+                       rocksdb::Status *statuses) {
+
   if (ctx.txn_context_enabled) {
     CHECK(options.snapshot != nullptr);
     CHECK(ctx.GetSnapshot()->GetSequenceNumber() == options.snapshot->GetSequenceNumber());

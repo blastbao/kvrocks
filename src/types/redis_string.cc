@@ -32,7 +32,8 @@
 
 namespace redis {
 
-std::vector<rocksdb::Status> String::getRawValues(engine::Context &ctx, const std::vector<Slice> &keys,
+std::vector<rocksdb::Status> String::getRawValues(engine::Context &ctx,
+                                                  const std::vector<Slice> &keys,
                                                   std::vector<std::string> *raw_values) {
   raw_values->clear();
 
@@ -40,57 +41,82 @@ std::vector<rocksdb::Status> String::getRawValues(engine::Context &ctx, const st
   raw_values->resize(keys.size());
   std::vector<rocksdb::Status> statuses(keys.size());
   std::vector<rocksdb::PinnableSlice> pin_values(keys.size());
-  storage_->MultiGet(ctx, read_options, metadata_cf_handle_, keys.size(), keys.data(), pin_values.data(),
+
+  storage_->MultiGet(ctx,
+                     read_options,
+                     metadata_cf_handle_,
+                     keys.size(),
+                     keys.data(),
+                     pin_values.data(),
                      statuses.data());
+
   for (size_t i = 0; i < keys.size(); i++) {
+    // 不存在，直接跳过，值为 Nil
     if (!statuses[i].ok()) continue;
+    // 保存返回值
     (*raw_values)[i].assign(pin_values[i].data(), pin_values[i].size());
+    // 从 raw_data 中解析 meta ，校验是否合法
     Metadata metadata(kRedisNone, false);
     Slice slice = (*raw_values)[i];
     auto s = ParseMetadataWithStats({kRedisString}, &slice, &metadata);
     if (!s.ok()) {
-      statuses[i] = s;
-      (*raw_values)[i].clear();
+      statuses[i] = s;          // 记录解析错误
+      (*raw_values)[i].clear(); // 清空
       continue;
     }
   }
   return statuses;
 }
 
+// 从 kvrocks 读取给定 ns_key 的原始值
+//
+// 在 Kvrocks 中，string 类型 raw_value 存储结构：
+//  +-------------------+---------------------+
+//  | metadata (TTL等)  |   用户实际的字符串值   |
+//  +-------------------+---------------------+
 rocksdb::Status String::getRawValue(engine::Context &ctx, const std::string &ns_key, std::string *raw_value) {
   raw_value->clear();
-
+  // 读取 meta
   auto s = GetRawMetadata(ctx, ns_key, raw_value);
   if (!s.ok()) return s;
-
+  // 解析 meta
   Metadata metadata(kRedisNone, false);
   Slice slice = *raw_value;
   s = ParseMetadataWithStats({kRedisString}, &slice, &metadata);
-  if (!s.ok()) raw_value->clear();
+  if (!s.ok()) raw_value->clear(); // 解析报错，清理数据
   return s;
 }
 
-rocksdb::Status String::getValueAndExpire(engine::Context &ctx, const std::string &ns_key, std::string *value,
-                                          uint64_t *expire) {
+// 1. 根据 ns_key 读取 string 类型原始值
+// 2. 从原始值中解析出 meta 和 value
+// 3. 把 value 和 expire 传出给调用者
+rocksdb::Status String::getValueAndExpire(engine::Context &ctx, const std::string &ns_key, std::string *value, uint64_t *expire) {
   value->clear();
 
+  // 从 kvrocks 读取给定 ns_key 的原始值
   std::string raw_value;
   auto s = getRawValue(ctx, ns_key, &raw_value);
   if (!s.ok()) return s;
 
+  // 从 raw_value 中提取用户数据
   size_t offset = Metadata::GetOffsetAfterExpire(raw_value[0]);
   *value = raw_value.substr(offset);
 
+  // 从 raw_value 中提取 meta ，获取其中 expire
   if (expire) {
     Metadata metadata(kRedisString, false);
     s = metadata.Decode(raw_value);
     if (!s.ok()) return s;
     *expire = metadata.expire;
   }
+
   return rocksdb::Status::OK();
 }
 
 rocksdb::Status String::getValue(engine::Context &ctx, const std::string &ns_key, std::string *value) {
+  // 1. 根据 ns_key 读取 string 类型原始值
+  // 2. 从原始值中解析出 meta 和 value
+  // 3. 把 value 和 expire 传出给调用者
   return getValueAndExpire(ctx, ns_key, value, nullptr);
 }
 
@@ -134,27 +160,37 @@ rocksdb::Status String::Append(engine::Context &ctx, const std::string &user_key
 
 std::vector<rocksdb::Status> String::MGet(engine::Context &ctx, const std::vector<Slice> &keys,
                                           std::vector<std::string> *values) {
+  // 根据用户 keys 生成带有 ns 前缀的 ns_keys
   std::vector<std::string> ns_keys;
   ns_keys.reserve(keys.size());
   for (const auto &key : keys) {
     std::string ns_key = AppendNamespacePrefix(key);
     ns_keys.emplace_back(ns_key);
   }
+
+  // 把 ns_keys 从 string 转换为 slice 类型
   std::vector<Slice> slice_keys;
   slice_keys.reserve(ns_keys.size());
   for (const auto &ns_key : ns_keys) {
     slice_keys.emplace_back(ns_key);
   }
+
+  // 批量获取
   return getValues(ctx, slice_keys, values);
 }
 
 rocksdb::Status String::Get(engine::Context &ctx, const std::string &user_key, std::string *value) {
+  // 生成以 ns 为前缀的实际存储键
   std::string ns_key = AppendNamespacePrefix(user_key);
+  // 从 kvrocks 中读取 value
   return getValue(ctx, ns_key, value);
 }
 
-rocksdb::Status String::GetEx(engine::Context &ctx, const std::string &user_key, std::string *value,
+rocksdb::Status String::GetEx(engine::Context &ctx,
+                              const std::string &user_key,
+                              std::string *value,
                               std::optional<uint64_t> expire) {
+
   std::string ns_key = AppendNamespacePrefix(user_key);
 
   rocksdb::Status s = getValue(ctx, ns_key, value);

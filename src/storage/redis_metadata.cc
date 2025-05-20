@@ -163,9 +163,10 @@ std::tuple<T, T> ExtractNamespaceKey(Slice ns_key, bool slot_id_encoded) {
 template std::tuple<Slice, Slice> ExtractNamespaceKey<Slice>(Slice ns_key, bool slot_id_encoded);
 template std::tuple<std::string, std::string> ExtractNamespaceKey<std::string>(Slice ns_key, bool slot_id_encoded);
 
+// 生成以 ns 为前缀的实际存储键
 std::string ComposeNamespaceKey(const Slice &ns, const Slice &key, bool slot_id_encoded) {
+  // ns_key = ns_size(1B) + ns_data + slot_id(2B,optional) + key
   std::string ns_key;
-
   PutFixed8(&ns_key, static_cast<uint8_t>(ns.size()));
   ns_key.append(ns.data(), ns.size());
 

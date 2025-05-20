@@ -47,31 +47,41 @@ Database::Database(engine::Storage *storage, std::string ns)
       metadata_cf_handle_(storage->GetCFHandle(ColumnFamilyID::Metadata)),
       namespace_(std::move(ns)) {}
 
+
+// 从 bytes 中解析 Metadata（TTL、类型、size等），并进行类型匹配、过期检查、空元素检查等验证，如果不合法或不匹配，就返回对应的 Status。
 rocksdb::Status Database::ParseMetadata(RedisTypes types, Slice *bytes, Metadata *metadata) {
+  // 备份当前 metadata ，为后续报错时回滚使用
   std::string old_metadata;
   metadata->Encode(&old_metadata);
 
+  // 把 bytes 解码为 metadata
   auto s = metadata->Decode(bytes);
   // delay InvalidArgument error check after type match check
+  // 出错返回
   if (!s.ok() && !s.IsInvalidArgument()) return s;
 
+  // 过期检查
   if (metadata->Expired()) {
     // error discarded here since it already failed
-    auto _ [[maybe_unused]] = metadata->Decode(old_metadata);
-    return rocksdb::Status::NotFound(kErrMsgKeyExpired);
+    auto _ [[maybe_unused]] = metadata->Decode(old_metadata); // 回滚
+    return rocksdb::Status::NotFound(kErrMsgKeyExpired);              // 过期
   }
 
   // if type is not matched, we still need to check if the metadata is valid.
+  // 类型不匹配
   if (!types.Contains(metadata->Type()) && (metadata->size > 0 || metadata->IsEmptyableType())) {
     // error discarded here since it already failed
-    auto _ [[maybe_unused]] = metadata->Decode(old_metadata);
-    return rocksdb::Status::InvalidArgument(kErrMsgWrongType);
+    auto _ [[maybe_unused]] = metadata->Decode(old_metadata);// 回滚
+    return rocksdb::Status::InvalidArgument(kErrMsgWrongType);       // 类型错误
   }
+
+  // 参数错误
   if (s.IsInvalidArgument()) return s;
 
+  // 空数据检查
   if (metadata->size == 0 && !metadata->IsEmptyableType()) {
     // error discarded here since it already failed
-    auto _ [[maybe_unused]] = metadata->Decode(old_metadata);
+    auto _ [[maybe_unused]] = metadata->Decode(old_metadata); // 回滚
     return rocksdb::Status::NotFound("no element found");
   }
   return s;
