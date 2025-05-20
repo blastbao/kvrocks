@@ -31,17 +31,20 @@
 
 /// WriteBatchIndexer traverses the operations in WriteBatch and appends to the
 /// specified WriteBatchWithIndex.
+//
+// WriteBatchIndexer 实现了 WriteBatch::Handler ，使得对 WriteBatch 的操作都镜像到 WriteBatchWithIndex 。
+// WriteBatchWithIndex 可以缓存事务内变更、支持高效查询。
 class WriteBatchIndexer : public rocksdb::WriteBatch::Handler {
  public:
-  explicit WriteBatchIndexer(engine::Storage* storage, rocksdb::WriteBatchWithIndex* dest_batch,
+  explicit WriteBatchIndexer(engine::Storage* storage,
+                             rocksdb::WriteBatchWithIndex* dest_batch,
                              const rocksdb::Snapshot* snapshot)
       : storage_(storage), dest_batch_(dest_batch), snapshot_(snapshot) {
     CHECK(storage != nullptr);
     CHECK(dest_batch != nullptr);
     CHECK(snapshot != nullptr);
   }
-  explicit WriteBatchIndexer(engine::Context& ctx)
-      : WriteBatchIndexer(ctx.storage, ctx.batch.get(), ctx.GetSnapshot()) {}
+  explicit WriteBatchIndexer(engine::Context& ctx): WriteBatchIndexer(ctx.storage, ctx.batch.get(), ctx.GetSnapshot()) {}
 
   rocksdb::Status PutCF(uint32_t column_family_id, const rocksdb::Slice& key, const rocksdb::Slice& value) override {
     return dest_batch_->Put(storage_->GetCFHandle(static_cast<ColumnFamilyID>(column_family_id)), key, value);
@@ -61,17 +64,21 @@ class WriteBatchIndexer : public rocksdb::WriteBatch::Handler {
 
   void SingleDelete(const rocksdb::Slice& key) override { dest_batch_->SingleDelete(key); }
 
-  rocksdb::Status DeleteRangeCF(uint32_t column_family_id, const rocksdb::Slice& begin_key,
+
+  // 特殊逻辑，因为 WriteBatchWithIndex 不支持原生 DeleteRange，需转换为逐个删除以保证索引正确性。
+  rocksdb::Status DeleteRangeCF(uint32_t column_family_id,
+                                const rocksdb::Slice& begin_key,
                                 const rocksdb::Slice& end_key) override {
+    // 1. 设置迭代范围 [begin_key, end_key)
     rocksdb::ReadOptions read_options = storage_->DefaultScanOptions();
     read_options.iterate_lower_bound = &begin_key;
     read_options.iterate_upper_bound = &end_key;
-    read_options.snapshot = snapshot_;
-
+    read_options.snapshot = snapshot_;  // 保证范围扫描的一致性
+    // 2. 创建组合迭代器（BaseDB + WriteBatch）
     auto cf_handle = storage_->GetCFHandle(static_cast<ColumnFamilyID>(column_family_id));
-
     auto iter = storage_->GetDB()->NewIterator(read_options, cf_handle);
     std::unique_ptr<rocksdb::Iterator> it(dest_batch_->NewIteratorWithBase(cf_handle, iter, &read_options));
+    // 3. 遍历范围内所有键并逐个删除
     for (it->Seek(begin_key); it->Valid() && it->key().compare(end_key) < 0; it->Next()) {
       auto s = dest_batch_->Delete(cf_handle, it->key());
       if (!s.ok()) {
