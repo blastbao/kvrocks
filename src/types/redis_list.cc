@@ -27,6 +27,13 @@
 
 namespace redis {
 
+// Redis 的 List 数据结构本质上是一个双端队列（deque），Kvrocks 通过将 index 与 sub_key 组合来唯一定位每个 list 元素，例如：
+//
+//  key = user:list
+//  index = 10000
+//  InternalKey = namespace + key + index + version + slotid
+
+// 获取 List 结构的 Meta
 rocksdb::Status List::GetMetadata(engine::Context &ctx, const Slice &ns_key, ListMetadata *metadata) {
   return Database::GetMetadata(ctx, {kRedisList}, ns_key, metadata);
 }
@@ -34,60 +41,82 @@ rocksdb::Status List::GetMetadata(engine::Context &ctx, const Slice &ns_key, Lis
 rocksdb::Status List::Size(engine::Context &ctx, const Slice &user_key, uint64_t *size) {
   *size = 0;
 
+  // 获取 meta
   std::string ns_key = AppendNamespacePrefix(user_key);
   ListMetadata metadata(false);
   rocksdb::Status s = GetMetadata(ctx, ns_key, &metadata);
   if (!s.ok()) return s.IsNotFound() ? rocksdb::Status::OK() : s;
+
+  // 返回 size
   *size = metadata.size;
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status List::Push(engine::Context &ctx, const Slice &user_key, const std::vector<Slice> &elems, bool left,
-                           uint64_t *new_size) {
+rocksdb::Status List::Push(engine::Context &ctx, const Slice &user_key, const std::vector<Slice> &elems, bool left, uint64_t *new_size) {
   return push(ctx, user_key, elems, true, left, new_size);
 }
 
-rocksdb::Status List::PushX(engine::Context &ctx, const Slice &user_key, const std::vector<Slice> &elems, bool left,
-                            uint64_t *new_size) {
+rocksdb::Status List::PushX(engine::Context &ctx, const Slice &user_key, const std::vector<Slice> &elems, bool left, uint64_t *new_size) {
   return push(ctx, user_key, elems, false, left, new_size);
 }
 
-rocksdb::Status List::push(engine::Context &ctx, const Slice &user_key, const std::vector<Slice> &elems,
-                           bool create_if_missing, bool left, uint64_t *new_size) {
+rocksdb::Status List::push(engine::Context &ctx,
+                           const Slice &user_key,           // 用户提供的键（如 Redis 的 list key）
+                           const std::vector<Slice> &elems, // 要插入的多个元素
+                           bool create_if_missing,          // 如果 key 不存在，是否自动创建
+                           bool left,                       // 插入方向, LPUSH or RPUSH
+                           uint64_t *new_size) {            // 输出参数，返回插入后列表的新长度
   *new_size = 0;
-  std::string ns_key = AppendNamespacePrefix(user_key);
+  std::string ns_key = AppendNamespacePrefix(user_key); // 基于 user_key 生成以 ns 为前缀的实际存储键
 
-  ListMetadata metadata;
-  auto batch = storage_->GetWriteBatchBase();
+
+  // 记录日志，用于 AOF 持久化和主从复制
   RedisCommand cmd = left ? kRedisCmdLPush : kRedisCmdRPush;
   WriteBatchLogData log_data(kRedisList, {std::to_string(cmd)});
+  auto batch = storage_->GetWriteBatchBase();
+  // Q: 为什么 PutLogData 只写了命令名（如 LPUSH），却没有把 elems（即 a b c 等待插入的元素）写进去？
+  // A: Kvrocks 的 LogData 就像一个元信息 header ，只是作为额外的“标记”或“元信息”用于区分 Redis 命令类型，方便持久化日志分析、恢复或审计。
+  //    kv 数据是在 WriteBatch 中写入的，LogData 会随 batch 一起写入 WAL（Write-Ahead Log），
   auto s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;
 
+  // 读取元数据，
+  ListMetadata metadata;
   s = GetMetadata(ctx, ns_key, &metadata);
   if (!s.ok() && !(create_if_missing && s.IsNotFound())) {
     return s.IsNotFound() ? rocksdb::Status::OK() : s;
   }
+
+  // 新插入元素的下标
   uint64_t index = left ? metadata.head - 1 : metadata.tail;
+
   for (const auto &elem : elems) {
     std::string index_buf;
+    // 将 index 编码成 8 字节的字符串，作为 subkey
     PutFixed64(&index_buf, index);
+    // 构造 list 子元素 elem 的 internal key
     std::string sub_key = InternalKey(ns_key, index_buf, metadata.version, storage_->IsSlotIdEncoded()).Encode();
+    // 以 key-value 格式存入 rocksdb
     s = batch->Put(sub_key, elem);
     if (!s.ok()) return s;
+    // 根据是 LPUSH 还是 RPUSH，更新 index
     left ? --index : ++index;
   }
+
+  // 更新 List 的元数据（head、tail、size、version 等）
   if (left) {
     metadata.head -= elems.size();
   } else {
     metadata.tail += elems.size();
   }
-  std::string bytes;
   metadata.size += elems.size();
+  std::string bytes;
   metadata.Encode(&bytes);
   s = batch->Put(metadata_cf_handle_, ns_key, bytes);
   if (!s.ok()) return s;
+  // 返回 list 新长度
   *new_size = metadata.size;
+  // 提交整个 batch ，其中包含 LogData、elems、meta
   return storage_->Write(ctx, storage_->DefaultWriteOptions(), batch->GetWriteBatch());
 }
 
@@ -102,7 +131,10 @@ rocksdb::Status List::Pop(engine::Context &ctx, const Slice &user_key, bool left
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status List::PopMulti(engine::Context &ctx, const rocksdb::Slice &user_key, bool left, uint32_t count,
+rocksdb::Status List::PopMulti(engine::Context &ctx,
+                               const rocksdb::Slice &user_key,
+                               bool left,
+                               uint32_t count,
                                std::vector<std::string> *elems) {
   elems->clear();
 

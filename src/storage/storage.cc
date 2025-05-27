@@ -602,19 +602,29 @@ rocksdb::Status Storage::Get(engine::Context &ctx, const rocksdb::ReadOptions &o
   return Get(ctx, options, db_->DefaultColumnFamily(), key, value);
 }
 
-rocksdb::Status Storage::Get(engine::Context &ctx, const rocksdb::ReadOptions &options,
-                             rocksdb::ColumnFamilyHandle *column_family, const rocksdb::Slice &key,
+rocksdb::Status Storage::Get(engine::Context &ctx,
+                             const rocksdb::ReadOptions &options,
+                             rocksdb::ColumnFamilyHandle *column_family,
+                             const rocksdb::Slice &key,
                              std::string *value) {
+  // 如果事务上下文启用（意味着使用 snapshot 保证一致性），则必须提供 snapshot。
+  // 比较 snapshot 的序列号，确保传入的 ReadOptions 与 ctx 的 snapshot 一致，避免读到不一致的数据。
   if (ctx.txn_context_enabled) {
     CHECK(options.snapshot != nullptr);
     CHECK(ctx.GetSnapshot()->GetSequenceNumber() == options.snapshot->GetSequenceNumber());
   }
+
+
   rocksdb::Status s;
   if (is_txn_mode_ && txn_write_batch_->GetWriteBatch()->Count() > 0) {
+    // 如果当前处于事务模式 is_txn_mode_，并且事务的 write_batch 中有数据，说明存在未提交的写入。
+    // 使用 GetFromBatchAndDB() 会优先从事务的 write_batch 读取，再 fallback 到 RocksDB ，确保读取到本事务中的写入（哪怕未提交）。
     s = txn_write_batch_->GetFromBatchAndDB(db_.get(), options, column_family, key, value);
   } else if (ctx.batch && ctx.txn_context_enabled) {
+    // 如果传入了 batch 且启用了事务上下文，说明当前操作可能在一个写入上下文中（但不是全局事务），也使用 GetFromBatchAndDB() 读取未写入 RocksDB 的数据。
     s = ctx.batch->GetFromBatchAndDB(db_.get(), options, column_family, key, value);
   } else {
+    // 记录统计信息
     s = db_->Get(options, column_family, key, value);
   }
 
@@ -627,8 +637,10 @@ rocksdb::Status Storage::Get(engine::Context &ctx, const rocksdb::ReadOptions &o
   return Get(ctx, options, db_->DefaultColumnFamily(), key, value);
 }
 
-rocksdb::Status Storage::Get(engine::Context &ctx, const rocksdb::ReadOptions &options,
-                             rocksdb::ColumnFamilyHandle *column_family, const rocksdb::Slice &key,
+rocksdb::Status Storage::Get(engine::Context &ctx,
+                             const rocksdb::ReadOptions &options,
+                             rocksdb::ColumnFamilyHandle *column_family,
+                             const rocksdb::Slice &key,
                              rocksdb::PinnableSlice *value) {
   if (ctx.txn_context_enabled) {
     CHECK(options.snapshot != nullptr);

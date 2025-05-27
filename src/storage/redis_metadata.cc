@@ -39,6 +39,9 @@ static std::atomic<uint64_t> version_counter_ = 0;
 
 constexpr const char *kErrMetadataTooShort = "metadata is too short";
 
+
+// InternalKey
+//
 // 数据结构：
 //  [namespace_len][namespace][slot_id?][key_len][key][version][sub_key]
 // 字段说明：
@@ -53,8 +56,6 @@ constexpr const char *kErrMetadataTooShort = "metadata is too short";
 //  | version        | 8 bytes            | 版本号，用于支持过期、事务等                        |
 //  | sub\_key       | 可变长（可选）       | 子键，比如 hash field、list index、zset member 等 |
 //  | -------------- | -------------------| ---------------------------------------------- |
-//
-//
 
 // 从一个编码后的字符串 input 中反解析出一个 InternalKey 对象。
 InternalKey::InternalKey(Slice input, bool slot_id_encoded) : slot_id_encoded_(slot_id_encoded) {
@@ -83,15 +84,28 @@ InternalKey::InternalKey(Slice input, bool slot_id_encoded) : slot_id_encoded_(s
 }
 
 // 构造 InternalKey
+//  - ns_key : 底层存储 key
+//  - sub_key : 子 key
+//  - version : 版本控制
+//  - slot_id_encoded : 是否在 ns_key 中包含 slotid 的标志
+//
+// 序列化后：
+//   [namespace_len][namespace][slot_id?][key_len][key][version][sub_key]
 InternalKey::InternalKey(Slice ns_key, Slice sub_key, uint64_t version, bool slot_id_encoded)
-    : sub_key_(sub_key), version_(version), slot_id_encoded_(slot_id_encoded) {
+ : sub_key_(sub_key), version_(version), slot_id_encoded_(slot_id_encoded) {
+
+  // 解析 namespace
   uint8_t namespace_size = 0;
   GetFixed8(&ns_key, &namespace_size);
   namespace_ = Slice(ns_key.data(), namespace_size);
+
+  // 解析 slotid
   ns_key.remove_prefix(namespace_size);
   if (slot_id_encoded_) {
     GetFixed16(&ns_key, &slotid_);
   }
+
+  // 解析 key
   key_ = ns_key;
 }
 
@@ -104,22 +118,33 @@ Slice InternalKey::GetSubKey() const { return sub_key_; }
 uint64_t InternalKey::GetVersion() const { return version_; }
 
 // 将一个 InternalKey 对象编码为字符串
+//
+// [命名空间长度(1字节)][命名空间内容][slot ID(2字节，可选)][主键长度(4字节)][主键内容][版本号(8字节)][子键内容]
 std::string InternalKey::Encode() const {
-  std::string out;
+  // 计算总字节长度
   size_t total = 1 + namespace_.size() + 4 + key_.size() + 8 + sub_key_.size();
-  if (slot_id_encoded_) {
+  if (slot_id_encoded_) { // 如果启用了 slot id 编码，额外增加 2 Bytes
     total += 2;
   }
+
+  // 构造输出缓冲
+  std::string out;
   out.resize(total);
   auto buf = out.data();
+
+  // 写入 ns size + ns
   buf = EncodeFixed8(buf, static_cast<uint8_t>(namespace_.size()));
   buf = EncodeBuffer(buf, namespace_);
+  // 写入 slot id
   if (slot_id_encoded_) {
     buf = EncodeFixed16(buf, slotid_);
   }
+  // 写入 key size + key
   buf = EncodeFixed32(buf, static_cast<uint32_t>(key_.size()));
   buf = EncodeBuffer(buf, key_);
+  // 写入 version
   buf = EncodeFixed64(buf, version_);
+  // 写入 sub key
   EncodeBuffer(buf, sub_key_);
   return out;
 }

@@ -142,8 +142,8 @@ class InternalKey {
 
  private:
   Slice namespace_;       // 命名空间
-  Slice key_;             // 主键
-  Slice sub_key_;         // 子键
+  Slice key_;             // 主键（去掉了 namespace、slotid 前缀）
+  Slice sub_key_;         // 子键（如 list 的元素、hash 的各个 field）
   uint64_t version_;      // 版本号（52bit 微秒 + 11bit 自增）
   uint16_t slotid_;       // 分片ID，仅在开启 slot_id_encoded_ 时生效
   bool slot_id_encoded_;  // 是否启用了 slot id 编码
@@ -170,8 +170,7 @@ class Metadata {
   // element size of the key-value
   uint64_t size;
 
-  explicit Metadata(RedisType type, bool generate_version = true,
-                    bool use_64bit_common_field = USE_64BIT_COMMON_FIELD_DEFAULT);
+  explicit Metadata(RedisType type, bool generate_version = true, bool use_64bit_common_field = USE_64BIT_COMMON_FIELD_DEFAULT);
 
   static void InitVersionCounter();
 

@@ -101,11 +101,19 @@ rocksdb::Status Database::GetMetadata(engine::Context &ctx, RedisTypes types, co
   return GetMetadata(ctx, types, ns_key, &raw_value, metadata, &rest);
 }
 
-rocksdb::Status Database::GetMetadata(engine::Context &ctx, RedisTypes types, const Slice &ns_key,
-                                      std::string *raw_value, Metadata *metadata, Slice *rest) {
+rocksdb::Status Database::GetMetadata(engine::Context &ctx,
+                                      RedisTypes types,
+                                      const Slice &ns_key,
+                                      std::string *raw_value,
+                                      Metadata *metadata,
+                                      Slice *rest) {
+
+  // 根据 ns_key 去 meta_cf 读取 meta
   auto s = GetRawMetadata(ctx, ns_key, raw_value);
   *rest = *raw_value;
   if (!s.ok()) return s;
+
+  // 解析 meta
   return ParseMetadataWithStats(types, rest, metadata);
 }
 
