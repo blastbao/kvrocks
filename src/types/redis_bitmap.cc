@@ -119,9 +119,7 @@ rocksdb::Status Bitmap::GetBit(engine::Context &ctx, const Slice &user_key, uint
   }
 
   rocksdb::PinnableSlice value;
-  std::string sub_key = InternalKey(ns_key, std::to_string(SegmentSubKeyIndexForBit(bit_offset)), metadata.version,
-                                    storage_->IsSlotIdEncoded())
-                            .Encode();
+  std::string sub_key = InternalKey(ns_key, std::to_string(SegmentSubKeyIndexForBit(bit_offset)), metadata.version,storage_->IsSlotIdEncoded()).Encode();
   s = storage_->Get(ctx, ctx.GetReadOptions(), sub_key, &value);
   // If s.IsNotFound(), it means all bits in this segment are 0,
   // so we can return with *bit == false directly.
@@ -456,40 +454,67 @@ rocksdb::Status Bitmap::BitPos(engine::Context &ctx, const Slice &user_key, bool
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status Bitmap::BitOp(engine::Context &ctx, BitOpFlags op_flag, const std::string &op_name,
-                              const Slice &user_key, const std::vector<Slice> &op_keys, int64_t *len) {
+// BITOP [operation] user_key op_key1 op_key2 ... op_keyN
+//
+// BitOp 是 Redis BITOP 命令的底层实现，它支持 AND / OR / XOR / NOT 四种位操作，主要流程：
+//  - 加载所有参与 bitmap 的 metadata 和数据片段。
+//  - 根据操作类型执行位操作（支持优化路径）。
+//  - 将结果写入目标 Key。
+//  - 更新 metadata，并提交写操作。
+//
+// 注意：
+//  - BITOP NOT 只支持一个输入 key
+//  - AND 如果某个参与 key 不存在，结果为空
+//  - 位图分片存储，子 key 由 frag_index 决定
+//  - fast path 优化仅在支持平台有效
+rocksdb::Status Bitmap::BitOp(engine::Context &ctx,
+                              BitOpFlags op_flag,                   // 操作类型（AND、OR、XOR、NOT）
+                              const std::string &op_name,           // 命令名，仅用于日志
+                              const Slice &user_key,                // 目标 Key
+                              const std::vector<Slice> &op_keys,    // 参与位运算的 Key 列表
+                              int64_t *len) {                       // 写入的目标 bitmap 长度
   std::string raw_value;
   std::string ns_key = AppendNamespacePrefix(user_key);
 
+  // 保存每个 op_key 对应的 meta
   std::vector<std::pair<std::string, BitmapMetadata>> meta_pairs;
+  // 记录 op_keys 中最大 bitmap 的大小
   uint64_t max_bitmap_size = 0;
 
+  // 遍历每个输入 bitmap ：获取元数据、类型检查、记录最大的位图大小、保存 <op_key, meta>
   for (const auto &op_key : op_keys) {
     BitmapMetadata metadata(false);
     std::string ns_op_key = AppendNamespacePrefix(op_key);
     auto s = GetMetadata(ctx, ns_op_key, &metadata, &raw_value);
+    // 忽略 NotFound 错误，其它错误则立即返回
     if (!s.ok()) {
       if (s.IsNotFound()) {
         continue;
       }
       return s;
     }
+    // 如果 Key 是普通字符串类型，返回错误
     if (metadata.Type() == kRedisString) {
       // Currently, we don't support bitop between bitmap and bitmap string.
       return rocksdb::Status::NotSupported(kErrMsgWrongType);
     }
+    // 更新最大位图大小
     if (metadata.size > max_bitmap_size) max_bitmap_size = metadata.size;
     meta_pairs.emplace_back(std::move(ns_op_key), metadata);
   }
   size_t num_keys = meta_pairs.size();
 
   auto batch = storage_->GetWriteBatchBase();
+
+  // 如果所有参与计算的 Bitmap 都为空，直接删除目标 Key，无需执行运算。
   if (max_bitmap_size == 0) {
     /* Compute the bit operation, if all bitmap is empty. cleanup the dest bitmap. */
     auto s = batch->Delete(metadata_cf_handle_, ns_key);
     if (!s.ok()) return s;
     return storage_->Write(ctx, storage_->DefaultWriteOptions(), batch->GetWriteBatch());
   }
+
+  // 写入操作日志
   std::vector<std::string> log_args = {std::to_string(kRedisCmdBitOp), op_name};
   for (const auto &op_key : op_keys) {
     log_args.emplace_back(op_key.ToString());
@@ -498,22 +523,24 @@ rocksdb::Status Bitmap::BitOp(engine::Context &ctx, BitOpFlags op_flag, const st
   auto s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;
 
+
   BitmapMetadata res_metadata;
   // If the operation is AND and the number of keys is less than the number of op_keys,
   // we can skip setting the subkeys of the result bitmap and just set the metadata.
   const bool can_skip_op = op_flag == kBitOpAnd && num_keys != op_keys.size();
   if (!can_skip_op) {
-    uint64_t stop_index = (max_bitmap_size - 1) / kBitmapSegmentBytes;
+    // 存储每个分片的计算结果
     std::unique_ptr<unsigned char[]> frag_res(new unsigned char[kBitmapSegmentBytes]);
-
     rocksdb::ReadOptions read_options = ctx.GetReadOptions();
+    // 每个 Bitmap 被分成多个 segment（片段），每片大小为 kBitmapSegmentBytes（常见值为 512 或 1024 字节），逐段执行位操作。
+    uint64_t stop_index = (max_bitmap_size - 1) / kBitmapSegmentBytes;
     for (uint64_t frag_index = 0; frag_index <= stop_index; frag_index++) {
       std::vector<rocksdb::PinnableSlice> fragments;
       uint16_t frag_maxlen = 0, frag_minlen = 0;
+      // 遍历每个 op_key 的第 frag_index 个片段
       for (const auto &meta_pair : meta_pairs) {
-        std::string sub_key = InternalKey(meta_pair.first, std::to_string(frag_index * kBitmapSegmentBytes),
-                                          meta_pair.second.version, storage_->IsSlotIdEncoded())
-                                  .Encode();
+        // 读取 op_key 当前片段
+        std::string sub_key = InternalKey(meta_pair.first, std::to_string(frag_index * kBitmapSegmentBytes), meta_pair.second.version, storage_->IsSlotIdEncoded()).Encode();
         rocksdb::PinnableSlice fragment;
         auto s = storage_->Get(ctx, read_options, sub_key, &fragment);
         if (!s.ok() && !s.IsNotFound()) {
@@ -548,6 +575,7 @@ rocksdb::Status Bitmap::BitOp(engine::Context &ctx, BitOpFlags op_flag, const st
          * result in GCC compiling the code using multiple-words load/store
          * operations that are not supported even in ARM >= v6. */
 #ifndef USE_ALIGNED_ACCESS
+        // 快速路径: 对较小数量（<= 16 个）的 Bitmap 且片段长度足够大时，直接按 64 位批量运算，加速处理。
         if (frag_minlen >= sizeof(uint64_t) * 4 && frag_numkeys <= 16) {
           auto *lres = reinterpret_cast<uint64_t *>(frag_res.get());
           const uint64_t *lp[16];
@@ -556,8 +584,8 @@ rocksdb::Status Bitmap::BitOp(engine::Context &ctx, BitOpFlags op_flag, const st
           }
           memcpy(frag_res.get(), fragments[0].data(), frag_minlen);
           auto apply_fast_path_op = [&](auto op) {
-            // Note: kBitOpNot cannot use this op, it only applying
-            // to kBitOpAnd, kBitOpOr, kBitOpXor.
+            // Note: kBitOpNot cannot use this op, it only applying to kBitOpAnd, kBitOpOr, kBitOpXor.
+            // 只支持 AND / OR / XOR 三种操作。
             CHECK(op_flag != kBitOpNot);
             while (frag_minlen >= sizeof(uint64_t) * 4) {
               for (uint64_t i = 1; i < frag_numkeys; i++) {
@@ -593,10 +621,15 @@ rocksdb::Status Bitmap::BitOp(engine::Context &ctx, BitOpFlags op_flag, const st
         }
 #endif
 
+        // 普通路径（逐字节位运算）
         uint8_t output = 0, byte = 0;
+        // 逐个字节的对 n 个 op_keys 的当前片段进行位运算
         for (; j < frag_maxlen; j++) {
+          // 先把 output 赋值为第一个 op_key 的 bitmap 当前片段的第 j 位
           output = (fragments[0].size() <= j) ? 0 : fragments[0][j];
           if (op_flag == kBitOpNot) output = ~output;
+
+          // 对其它 n-1 个 op_keys 的 bitmap 的当前片段的第 j 位做位操作
           for (uint64_t i = 1; i < frag_numkeys; i++) {
             byte = (fragments[i].size() <= j) ? 0 : fragments[i][j];
             switch (op_flag) {
@@ -632,15 +665,16 @@ rocksdb::Status Bitmap::BitOp(engine::Context &ctx, BitOpFlags op_flag, const st
             frag_maxlen = kBitmapSegmentBytes;
           }
         }
-        std::string sub_key = InternalKey(ns_key, std::to_string(frag_index * kBitmapSegmentBytes),
-                                          res_metadata.version, storage_->IsSlotIdEncoded())
-                                  .Encode();
+
+        // 把每段处理后的结果 frag_res 写入 RocksDB 子 key
+        std::string sub_key = InternalKey(ns_key, std::to_string(frag_index * kBitmapSegmentBytes),res_metadata.version, storage_->IsSlotIdEncoded()).Encode();
         auto s = batch->Put(sub_key, Slice(reinterpret_cast<char *>(frag_res.get()), frag_maxlen));
         if (!s.ok()) return s;
       }
     }
   }
 
+  // 更新目标 bitmap 的元数据（size/version）
   std::string bytes;
   res_metadata.size = max_bitmap_size;
   res_metadata.Encode(&bytes);
