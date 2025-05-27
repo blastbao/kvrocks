@@ -202,8 +202,38 @@ rocksdb::Status List::PopMulti(engine::Context &ctx,
  * then trim the list from tail with num of elems to delete, here is 2.
  * and list would become: | E1 | E2 | E3 | E4 | E5 | E6 |
  */
-rocksdb::Status List::Rem(engine::Context &ctx, const Slice &user_key, int count, const Slice &elem,
-                          uint64_t *removed_cnt) {
+//
+// LREM key count value
+//
+// 功能：
+//  - 删除 list 中和 value 相等的元素。
+// 参数说明：
+//  count ：
+//    - > 0：从 头部 开始，最多删除 count 个；
+//    - < 0：从 尾部 开始，最多删除 count 个；
+//    - = 0：删除所有匹配项。
+// 执行过程：
+//  - 找出所有要删除的元素下标；
+//  - 根据左右剩余元素的数量，决定“从左移”还是“从右移”；
+//  - 执行“覆盖式移动”：用剩下的元素覆盖被删元素；
+//  - 更新 metadata（head/tail/size），并删除尾部无效数据。
+//
+// 举例说明：
+//  - 原列表: E1 | E2 | E3 | hello | E4 | E5 | hello | E6
+//  - 删除 hello 后:
+//    1. 找到要删除的索引 [3,6]
+//    2. 右侧元素较少(4个)，选择从右向左移动
+//    3. 逐步移动 E4,E5,E6 覆盖 hello 的位置
+//    4. 最终列表: E1 | E2 | E3 | E4 | E5 | E6
+//
+//
+// 删除整个 List 是通过删除其元数据（metadata）来实现的
+//  - Kvrocks 使用元数据（metadata）+ 多个子 key（subkey） 结构
+//  - 删除 metadata 相当于让这个 list 在逻辑上“失效”，这些元素键虽然物理存在，但逻辑上已不可访问
+//  - 后续对该 list 的操作（如 LPUSH, LRANGE）会自动使用新的 version(+1)；
+//  - 老版本的子 key 即使还存在，也不会被访问；
+//  - 后台 compact 时会清理这些无效数据。
+rocksdb::Status List::Rem(engine::Context &ctx, const Slice &user_key, int count, const Slice &elem, uint64_t *removed_cnt) {
   *removed_cnt = 0;
 
   std::string ns_key = AppendNamespacePrefix(user_key);
@@ -227,9 +257,9 @@ rocksdb::Status List::Rem(engine::Context &ctx, const Slice &user_key, int count
   rocksdb::Slice lower_bound(prefix);
   read_options.iterate_lower_bound = &lower_bound;
 
+  // 遍历列表查找所有值为 elem 的元素，将下标记录到 to_delete_indexes 中，最多删除 count 个元素；
   auto iter = util::UniqueIterator(ctx, read_options);
-  for (iter->Seek(start_key); iter->Valid() && iter->key().starts_with(prefix);
-       !reversed ? iter->Next() : iter->Prev()) {
+  for (iter->Seek(start_key); iter->Valid() && iter->key().starts_with(prefix);!reversed ? iter->Next() : iter->Prev()) {
     if (iter->value() == elem) {
       InternalKey ikey(iter->key(), storage_->IsSlotIdEncoded());
       Slice sub_key = ikey.GetSubKey();
@@ -247,10 +277,12 @@ rocksdb::Status List::Rem(engine::Context &ctx, const Slice &user_key, int count
   s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;
 
+  // 当要删除的元素数量等于列表大小时，直接删除整个列表
   if (to_delete_indexes.size() == metadata.size) {
     s = batch->Delete(metadata_cf_handle_, ns_key);
     if (!s.ok()) return s;
   } else {
+    // 确定最优移动方向
     uint64_t min_to_delete_index = !reversed ? to_delete_indexes[0] : to_delete_indexes[to_delete_indexes.size() - 1];
     uint64_t max_to_delete_index = !reversed ? to_delete_indexes[to_delete_indexes.size() - 1] : to_delete_indexes[0];
     uint64_t left_part_len = max_to_delete_index - metadata.head;
@@ -260,9 +292,10 @@ rocksdb::Status List::Rem(engine::Context &ctx, const Slice &user_key, int count
     PutFixed64(&buf, reversed ? max_to_delete_index : min_to_delete_index);
     start_key = InternalKey(ns_key, buf, metadata.version, storage_->IsSlotIdEncoded()).Encode();
     size_t processed = 0;
-    for (iter->Seek(start_key); iter->Valid() && iter->key().starts_with(prefix);
-         !reversed ? iter->Next() : iter->Prev()) {
+    // 移动非删除元素
+    for (iter->Seek(start_key); iter->Valid() && iter->key().starts_with(prefix); !reversed ? iter->Next() : iter->Prev()) {
       if (iter->value() != elem || processed >= to_delete_indexes.size()) {
+        // 将保留的元素移动到删除元素的位置上，实现元素的"覆盖"操作
         buf.clear();
         PutFixed64(&buf, reversed ? max_to_delete_index-- : min_to_delete_index++);
         std::string to_update_key = InternalKey(ns_key, buf, metadata.version, storage_->IsSlotIdEncoded()).Encode();
@@ -273,6 +306,7 @@ rocksdb::Status List::Rem(engine::Context &ctx, const Slice &user_key, int count
       }
     }
 
+    // 删除多余元素
     for (uint64_t idx = 0; idx < to_delete_indexes.size(); ++idx) {
       buf.clear();
       PutFixed64(&buf, reversed ? (metadata.head + idx) : (metadata.tail - 1 - idx));
@@ -280,6 +314,8 @@ rocksdb::Status List::Rem(engine::Context &ctx, const Slice &user_key, int count
       s = batch->Delete(to_delete_key);
       if (!s.ok()) return s;
     }
+
+    // 更新元数据
     if (reversed) {
       metadata.head += to_delete_indexes.size();
     } else {
@@ -296,28 +332,40 @@ rocksdb::Status List::Rem(engine::Context &ctx, const Slice &user_key, int count
   return storage_->Write(ctx, storage_->DefaultWriteOptions(), batch->GetWriteBatch());
 }
 
-rocksdb::Status List::Insert(engine::Context &ctx, const Slice &user_key, const Slice &pivot, const Slice &elem,
-                             bool before, int *new_size) {
-  *new_size = 0;
-  std::string ns_key = AppendNamespacePrefix(user_key);
 
+// LINSERT mylist BEFORE|AFTER pivot value
+//
+// 插入过程：找到 pivot 所在位置，并移动其后（或前面）的元素为新元素腾出空间，插入该新元素，同时更新 metadata 和写入 RocksDB 。
+rocksdb::Status List::Insert(engine::Context &ctx,
+                             const Slice &user_key,  // 用户传入的 key
+                             const Slice &pivot,     // 要插入位置参考的 pivot 元素
+                             const Slice &elem,      // 要插入的新元素
+                             bool before,            // 插入在前还是后
+                             int *new_size) {        // 返回新列表长度（失败返回 -1）
+  *new_size = 0;
+
+  // 获取列表元数据（head, tail, size, version 等）
+  std::string ns_key = AppendNamespacePrefix(user_key);
   ListMetadata metadata(false);
   rocksdb::Status s = GetMetadata(ctx, ns_key, &metadata);
   if (!s.ok()) return s;
 
   std::string buf;
-  uint64_t pivot_index = metadata.head - 1;
-  PutFixed64(&buf, metadata.head);
+  uint64_t pivot_index = metadata.head - 1;  // 初始化 pivot 为 head-1
+  PutFixed64(&buf, metadata.head); // 将 metadata.head 编码为 8 字节二进制存入 buf
+  // 起始键，指向列表的第一个元素，包含命名空间、精确索引、版本号；通过起始键可以直接跳转到列表头部，避免全表扫描
   std::string start_key = InternalKey(ns_key, buf, metadata.version, storage_->IsSlotIdEncoded()).Encode();
+  // 前缀键，匹配当前版本下列表的所有元素键
   std::string prefix = InternalKey(ns_key, "", metadata.version, storage_->IsSlotIdEncoded()).Encode();
+  // 下一版本前缀键，作为迭代边界（iterate_upper_bound），防止跨版本扫描；RocksDB 迭代器需要显式指定范围，通过设置 upper_bound 为下一版本的起始键，确保只扫描当前版本的数据。
   std::string next_version_prefix = InternalKey(ns_key, "", metadata.version + 1, storage_->IsSlotIdEncoded()).Encode();
-
+  // 从 start_key 开始遍历列表
   rocksdb::ReadOptions read_options = ctx.DefaultScanOptions();
   rocksdb::Slice upper_bound(next_version_prefix);
   read_options.iterate_upper_bound = &upper_bound;
-
   auto iter = util::UniqueIterator(ctx, read_options);
   for (iter->Seek(start_key); iter->Valid() && iter->key().starts_with(prefix); iter->Next()) {
+    // 找到目标 pivot 元素
     if (iter->value() == pivot) {
       InternalKey ikey(iter->key(), storage_->IsSlotIdEncoded());
       Slice sub_key = ikey.GetSubKey();
@@ -325,27 +373,42 @@ rocksdb::Status List::Insert(engine::Context &ctx, const Slice &user_key, const 
       break;
     }
   }
+  // 如果没找到，返回 NotFound
   if (pivot_index == (metadata.head - 1)) {
     *new_size = -1;
     return rocksdb::Status::NotFound();
   }
 
+  // 准备写 rocksdb
   auto batch = storage_->GetWriteBatchBase();
-  WriteBatchLogData log_data(kRedisList,
-                             {std::to_string(kRedisCmdLInsert), before ? "1" : "0", pivot.ToString(), elem.ToString()});
+  WriteBatchLogData log_data(kRedisList,{std::to_string(kRedisCmdLInsert), before ? "1" : "0", pivot.ToString(), elem.ToString()});
   s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;
 
+  // Kvrocks 中 List 在插入元素时，必须把相关元素向后或向前移动，为新元素让出下标位置。
+  // 为了尽可能减少要 “搬移” 的元素数，要从两个方向计算需要移动的元素数目，选择移动更少的方案，减少需要更新的键值对数量。
+  //
+  // left_part_len: 计算 pivot 左侧(头部方向)的元素数量
+  //  - 如果插入在 pivot 前(before=true)，则不包含 pivot 本身
+  //  - 如果插入在 pivot 后(before=false)，则包含 pivot
+  // right_part_len: 计算 pivot 右侧(尾部方向)的元素数量
+  //  - 如果插入在 pivot 前(before=true)，则包含 pivot 本身
+  //  - 如果插入在 pivot 后(before=false)，则不包含 pivot
   uint64_t left_part_len = pivot_index - metadata.head + (before ? 0 : 1);
   uint64_t right_part_len = metadata.tail - 1 - pivot_index + (before ? 1 : 0);
+  // true  表示选择"向左移动元素"(从头部方向操作)
+  // false 表示选择"向右移动元素"(从尾部方向操作)
   bool reversed = left_part_len <= right_part_len;
+  // 当移动方向与插入方向一致时(从左侧操作且插入基准后 或者 从右侧操作且插入基准前)，直接使用 pivot 的位置，否则基于 pivot_index 做调整得到新元素位置
   uint64_t new_elem_index = 0;
   if ((reversed && !before) || (!reversed && before)) {
     new_elem_index = pivot_index;
   } else {
     new_elem_index = reversed ? --pivot_index : ++pivot_index;
-    !reversed ? iter->Next() : iter->Prev();
+    !reversed ? iter->Next() : iter->Prev(); // 因为 pivot 需要被移动，调整 iter
   }
+
+  // 遍历需要移动的元素，把每个旧 key 的值重新写到新的 key（index ±1），所有元素整体前(后)移一格
   for (; iter->Valid() && iter->key().starts_with(prefix); !reversed ? iter->Next() : iter->Prev()) {
     buf.clear();
     PutFixed64(&buf, reversed ? --pivot_index : ++pivot_index);
@@ -353,12 +416,15 @@ rocksdb::Status List::Insert(engine::Context &ctx, const Slice &user_key, const 
     s = batch->Put(to_update_key, iter->value());
     if (!s.ok()) return s;
   }
+
+  // 插入新元素
   buf.clear();
   PutFixed64(&buf, new_elem_index);
   std::string to_update_key = InternalKey(ns_key, buf, metadata.version, storage_->IsSlotIdEncoded()).Encode();
   s = batch->Put(to_update_key, elem);
   if (!s.ok()) return s;
 
+  // 更新 meta ，包括 head(tail)、size
   if (reversed) {
     metadata.head--;
   } else {
@@ -370,7 +436,9 @@ rocksdb::Status List::Insert(engine::Context &ctx, const Slice &user_key, const 
   s = batch->Put(metadata_cf_handle_, ns_key, bytes);
   if (!s.ok()) return s;
 
+  // 返回最新列表长度
   *new_size = static_cast<int>(metadata.size);
+  // 写入 rocksdb
   return storage_->Write(ctx, storage_->DefaultWriteOptions(), batch->GetWriteBatch());
 }
 
@@ -433,8 +501,7 @@ rocksdb::Status List::Range(engine::Context &ctx, const Slice &user_key, int sta
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status List::Pos(engine::Context &ctx, const Slice &user_key, const Slice &elem, const PosSpec &spec,
-                          std::vector<int64_t> *indexes) {
+rocksdb::Status List::Pos(engine::Context &ctx, const Slice &user_key, const Slice &elem, const PosSpec &spec,std::vector<int64_t> *indexes) {
   indexes->clear();
 
   std::string ns_key = AppendNamespacePrefix(user_key);
@@ -661,24 +728,29 @@ rocksdb::Status List::Trim(engine::Context &ctx, const Slice &user_key, int star
   uint32_t trim_cnt = 0;
   std::string ns_key = AppendNamespacePrefix(user_key);
 
+  // 获取元数据
   ListMetadata metadata(false);
   rocksdb::Status s = GetMetadata(ctx, ns_key, &metadata);
   if (!s.ok()) return s.IsNotFound() ? rocksdb::Status::OK() : s;
-
+  // 处理边界：Redis 支持负数索引（例如 -1 表示最后一个元素）
   if (start < 0) start += static_cast<int>(metadata.size);
   if (stop < 0) stop = static_cast<int>(metadata.size) >= -1 * stop ? static_cast<int>(metadata.size) + stop : -1;
-  // the result will be empty list when start > stop,
-  // or start is larger than the end of list
+
+  // the result will be empty list when start > stop, or start is larger than the end of list
+  // 当 start > stop 时，表示无效范围，直接删除整个列表
   if (start > stop) {
     return storage_->Delete(ctx, storage_->DefaultWriteOptions(), metadata_cf_handle_, ns_key);
   }
+  // 确保 start 不小于 0
   if (start < 0) start = 0;
 
   auto batch = storage_->GetWriteBatchBase();
-  WriteBatchLogData log_data(kRedisList, std::vector<std::string>{std::to_string(kRedisCmdLTrim), std::to_string(start),
-                                                                  std::to_string(stop)});
+  // 记录操作日志
+  WriteBatchLogData log_data(kRedisList, std::vector<std::string>{std::to_string(kRedisCmdLTrim), std::to_string(start), std::to_string(stop)});
   s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;
+
+  // 删除左侧元素：从 head 到 start 前的元素全部删除
   uint64_t left_index = metadata.head + start;
   uint64_t right_index = metadata.head + stop + 1;
   for (uint64_t i = metadata.head; i < left_index; i++) {
@@ -690,6 +762,7 @@ rocksdb::Status List::Trim(engine::Context &ctx, const Slice &user_key, int star
     metadata.head++;
     trim_cnt++;
   }
+  // 删除右侧元素：从 stop 后到 tail 的元素全部删除
   auto tail = metadata.tail;
   for (uint64_t i = right_index; i < tail; i++) {
     std::string buf;
@@ -700,6 +773,8 @@ rocksdb::Status List::Trim(engine::Context &ctx, const Slice &user_key, int star
     metadata.tail--;
     trim_cnt++;
   }
+
+  // 更新元数据
   if (metadata.size >= trim_cnt) {
     metadata.size -= trim_cnt;
   } else {

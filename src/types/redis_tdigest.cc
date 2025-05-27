@@ -109,23 +109,28 @@ class DummyCentroids {
 
 uint32_t constexpr kMaxElements = 1 * 1024;  // 1k doubles
 
+
+// TDigest 是计算近似分位数的概率数据结构，常用于近似计算 p99/p95 等百分位指标，具有高精度和压缩能力。
 rocksdb::Status TDigest::Create(engine::Context& ctx, const Slice& digest_name, const TDigestCreateOptions& options,
                                 bool* exists) {
+
+  // 检查压缩参数是否合法
   if (options.compression > kTDigestMaxCompression) {
     return rocksdb::Status::InvalidArgument(fmt::format("compression should be less than {}", kTDigestMaxCompression));
   }
 
-  auto ns_key = AppendNamespacePrefix(digest_name);
+  // 计算容量，capacity = options.compression * 6 + 10
   auto capacity = options.compression * 6 + 10;
   capacity = ((capacity < kMaxElements) ? capacity : kMaxElements);
-  TDigestMetadata metadata(options.compression, capacity);
 
+  // 读取 meta
+  TDigestMetadata metadata(options.compression, capacity);
+  auto ns_key = AppendNamespacePrefix(digest_name);
   auto status = getMetaDataByNsKey(ctx, ns_key, &metadata);
   *exists = status.ok();
-  if (*exists) {
+  if (*exists) { // 已经存在，报错
     return rocksdb::Status::InvalidArgument("tdigest already exists");
   }
-
   if (!status.IsNotFound()) {
     return status;
   }
@@ -136,6 +141,7 @@ rocksdb::Status TDigest::Create(engine::Context& ctx, const Slice& digest_name, 
     return status;
   }
 
+  // 将新建的 meta 存入 rocksdb ，这也就意味着创建了一个 digest
   std::string metadata_bytes;
   metadata.Encode(&metadata_bytes);
   if (status = batch->Put(metadata_cf_handle_, ns_key, metadata_bytes); !status.ok()) {
@@ -147,7 +153,6 @@ rocksdb::Status TDigest::Create(engine::Context& ctx, const Slice& digest_name, 
 
 rocksdb::Status TDigest::Add(engine::Context& ctx, const Slice& digest_name, const std::vector<double>& inputs) {
   auto ns_key = AppendNamespacePrefix(digest_name);
-
   TDigestMetadata metadata;
   if (auto status = getMetaDataByNsKey(ctx, ns_key, &metadata); !status.ok()) {
     return status;
@@ -159,23 +164,29 @@ rocksdb::Status TDigest::Add(engine::Context& ctx, const Slice& digest_name, con
     return status;
   }
 
+  // 增加总观测点数
   metadata.total_observations += inputs.size();
+  // 增加总权重（这里假设每个数据点权重为1）
   metadata.total_weight += inputs.size();
+  // 更新全局最小/最大值
   auto [buffer_min, buffer_max] = std::minmax_element(inputs.cbegin(), inputs.cend());
   metadata.maximum = std::max(metadata.maximum, *buffer_max);
   metadata.minimum = std::min(metadata.minimum, *buffer_min);
 
   if (metadata.unmerged_nodes + inputs.size() <= metadata.capacity) {
+    // 缓冲区未满，直接追加
     if (auto status = appendBuffer(ctx, batch, ns_key, inputs, &metadata); !status.ok()) {
       return status;
     }
     metadata.unmerged_nodes += inputs.size();
   } else {
+    // 缓冲区已满，执行合并
     if (auto status = mergeCurrentBuffer(ctx, ns_key, batch, &metadata, &inputs); !status.ok()) {
       return status;
     }
   }
 
+  // 更新元数据并提交
   std::string metadata_bytes;
   metadata.Encode(&metadata_bytes);
   if (auto status = batch->Put(metadata_cf_handle_, ns_key, metadata_bytes); !status.ok()) {
@@ -378,8 +389,10 @@ rocksdb::Status TDigest::decodeCentroidFromKeyValue(const rocksdb::Slice& key, c
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status TDigest::appendBuffer(engine::Context& ctx, ObserverOrUniquePtr<rocksdb::WriteBatchBase>& batch,
-                                      const std::string& ns_key, const std::vector<double>& inputs,
+rocksdb::Status TDigest::appendBuffer(engine::Context& ctx,
+                                      ObserverOrUniquePtr<rocksdb::WriteBatchBase>& batch,
+                                      const std::string& ns_key,
+                                      const std::vector<double>& inputs,
                                       TDigestMetadata* metadata) {
   // must guard by lock
   auto buffer_key = internalBufferKey(ns_key, *metadata);
@@ -390,7 +403,7 @@ rocksdb::Status TDigest::appendBuffer(engine::Context& ctx, ObserverOrUniquePtr<
   }
 
   for (auto item : inputs) {
-    PutDouble(&buffer_value, item);
+    PutDouble(&buffer_value, item); // append to std::string
   }
 
   if (auto status = batch->Put(cf_handle_, buffer_key, buffer_value); !status.ok()) {

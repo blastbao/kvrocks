@@ -39,9 +39,8 @@ std::vector<rocksdb::Status> String::getRawValues(engine::Context &ctx,
 
   rocksdb::ReadOptions read_options = ctx.DefaultMultiGetOptions();
   raw_values->resize(keys.size());
-  std::vector<rocksdb::Status> statuses(keys.size());
-  std::vector<rocksdb::PinnableSlice> pin_values(keys.size());
-
+  std::vector<rocksdb::Status> statuses(keys.size());           // 读取状态
+  std::vector<rocksdb::PinnableSlice> pin_values(keys.size());  // 读取值
   storage_->MultiGet(ctx,
                      read_options,
                      metadata_cf_handle_,
@@ -120,8 +119,7 @@ rocksdb::Status String::getValue(engine::Context &ctx, const std::string &ns_key
   return getValueAndExpire(ctx, ns_key, value, nullptr);
 }
 
-std::vector<rocksdb::Status> String::getValues(engine::Context &ctx, const std::vector<Slice> &ns_keys,
-                                               std::vector<std::string> *values) {
+std::vector<rocksdb::Status> String::getValues(engine::Context &ctx, const std::vector<Slice> &ns_keys, std::vector<std::string> *values) {
   auto statuses = getRawValues(ctx, ns_keys, values);
   for (size_t i = 0; i < ns_keys.size(); i++) {
     if (!statuses[i].ok()) continue;

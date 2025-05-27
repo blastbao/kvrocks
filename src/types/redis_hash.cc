@@ -156,8 +156,33 @@ rocksdb::Status Hash::IncrByFloat(engine::Context &ctx, const Slice &user_key, c
   return storage_->Write(ctx, storage_->DefaultWriteOptions(), batch->GetWriteBatch());
 }
 
-rocksdb::Status Hash::MGet(engine::Context &ctx, const Slice &user_key, const std::vector<Slice> &fields,
-                           std::vector<std::string> *values, std::vector<rocksdb::Status> *statuses) {
+
+// 流程：
+//  1. 读取 metadata（version 信息）
+//  2. 构造每个 field 的 RocksDB key（含 version）
+//  3. 使用 RocksDB MultiGet 批量查询
+//  4. 写入 values / statuses，保持与 fields 一一对应
+//
+//
+// 举例：
+//  执行命令：
+//    HMGET myhash a b c
+//  假设：
+//    Redis 哈希表 myhash 当前 version 为 7；
+//    RocksDB 子键为：
+//      - myns:myhash|a|v=7 => "val1"
+//      - myns:myhash|b|v=7 => "val2"
+//      - myns:myhash|c|v=7 => not found
+//  返回结果：
+//    - values:   ["val1", "val2", ""]
+//    - statuses: [OK, OK, NotFound]
+//
+//
+rocksdb::Status Hash::MGet(engine::Context &ctx,
+                           const Slice &user_key,                       // Redis 层的哈希表名，如 HMGET myhash a b 中的 "myhash"，不是 kvrocks 底层存储 key
+                           const std::vector<Slice> &fields,            // 字段名列表
+                           std::vector<std::string> *values,            // 返回值列表，和 fields 顺序一一对应
+                           std::vector<rocksdb::Status> *statuses) {    // 每个字段对应的 RocksDB 查询状态（OK 表示找到，IsNotFound() 表示没找到）。
   values->clear();
   statuses->clear();
 
@@ -168,9 +193,8 @@ rocksdb::Status Hash::MGet(engine::Context &ctx, const Slice &user_key, const st
     return s;
   }
 
-  rocksdb::ReadOptions read_options = ctx.DefaultMultiGetOptions();
+  // 将每个 field 转换为内部 RocksDB key
   std::vector<rocksdb::Slice> keys;
-
   keys.reserve(fields.size());
   std::vector<std::string> sub_keys;
   sub_keys.resize(fields.size());
@@ -180,13 +204,15 @@ rocksdb::Status Hash::MGet(engine::Context &ctx, const Slice &user_key, const st
     keys.emplace_back(sub_keys[i]);
   }
 
-  std::vector<rocksdb::PinnableSlice> values_vector;
+  // 批量读取多个 keys
+  std::vector<rocksdb::PinnableSlice> values_vector;  // 存储每个 key 的读取结果，PinnableSlice 可以避免数据拷贝
   values_vector.resize(keys.size());
-  std::vector<rocksdb::Status> statuses_vector;
+  std::vector<rocksdb::Status> statuses_vector;       // 存储每个 key 的读取状态
   statuses_vector.resize(keys.size());
-  storage_->MultiGet(ctx, read_options, storage_->GetDB()->DefaultColumnFamily(), keys.size(), keys.data(),
-                     values_vector.data(), statuses_vector.data());
+  rocksdb::ReadOptions read_options = ctx.DefaultMultiGetOptions();
+  storage_->MultiGet(ctx, read_options, storage_->GetDB()->DefaultColumnFamily(), keys.size(), keys.data(),values_vector.data(), statuses_vector.data());
   for (size_t i = 0; i < keys.size(); i++) {
+    // 如果出错但是错误不是 NotFound ，立即返回；也就是说只能接受 NotFound 错误，其它错误都立即返回；
     if (!statuses_vector[i].ok() && !statuses_vector[i].IsNotFound()) return statuses_vector[i];
     values->emplace_back(values_vector[i].ToString());
     statuses->emplace_back(statuses_vector[i]);

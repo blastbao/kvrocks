@@ -72,16 +72,21 @@ rocksdb::Status Set::Add(engine::Context &ctx, const Slice &user_key, const std:
   if (!s.ok()) return s;
   std::unordered_set<std::string_view> mset;
   for (const auto &member : members) {
+    // 避免添加重复元素
     if (!mset.insert(member.ToStringView()).second) {
       continue;
     }
+    // 检查 member 是否已经存在
     std::string sub_key = InternalKey(ns_key, member, metadata.version, storage_->IsSlotIdEncoded()).Encode();
     s = storage_->Get(ctx, ctx.GetReadOptions(), sub_key, &value);
     if (s.ok()) continue;
+    // 添加新 member
     s = batch->Put(sub_key, Slice());
     if (!s.ok()) return s;
     *added_cnt += 1;
   }
+
+  // 更新元数据
   if (*added_cnt > 0) {
     metadata.size += *added_cnt;
     std::string bytes;

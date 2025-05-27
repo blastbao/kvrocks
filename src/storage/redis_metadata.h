@@ -165,7 +165,7 @@ class Metadata {
   uint64_t expire;
 
   // the current version: 53bit timestamp + 11bit counter
-  uint64_t version;
+  uint64_t version; // version 能够支持惰性删除；
 
   // element size of the key-value
   uint64_t size;

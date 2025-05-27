@@ -694,8 +694,8 @@ void Storage::MultiGet(engine::Context &ctx,                          // Kvrocks
                        rocksdb::ColumnFamilyHandle *column_family,    // 列族
                        const size_t num_keys,                         // 读取的 key 数量
                        const rocksdb::Slice *keys,                    // 读取的 key 数组
-                       rocksdb::PinnableSlice *values,                // 接收返回值列表
-                       rocksdb::Status *statuses) {                   // 每个 key 对应的返回状态
+                       rocksdb::PinnableSlice *values,                // 返回值列表
+                       rocksdb::Status *statuses) {                   // 返回状态列表
 
   // 事务一致性校验
   // 如果启用事务上下文（比如在 Lua 脚本或事务块里），要求 options.snapshot 必须存在；
@@ -706,8 +706,7 @@ void Storage::MultiGet(engine::Context &ctx,                          // Kvrocks
   }
 
   if (is_txn_mode_ && txn_write_batch_->GetWriteBatch()->Count() > 0) {
-    // 如果 Storage 当前是事务模式，且当前批次(txn_write_batch_)中有未提交写入数据，就先从 WriteBatch 中读取（未写入 DB 的临时数据），然后再从 DB 中读取；
-    // 这样，能够读到尚未提交的写数据；
+    // 如果 Storage 当前是事务模式，且当前批次(txn_write_batch_)中有未提交写入数据，就先从 WriteBatch 中读取（未写入 DB 的临时数据），然后再从 DB 中读取，这样，能够读到尚未提交的写数据；
     txn_write_batch_->MultiGetFromBatchAndDB(db_.get(), options, column_family, num_keys, keys, values, statuses,false);
   } else if (ctx.txn_context_enabled && ctx.batch) {
     // 如果不是全局事务模式，而是上下文层面启用了事务（如 Lua 脚本执行），并且当前 ctx 中有未提交的写入(ctx.batch) ，就先从 ctx 的WriteBatch 中读取（未写入 DB 的临时数据），然后再从 DB 中读取；
