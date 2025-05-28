@@ -34,12 +34,14 @@ rocksdb::Status Json::write(engine::Context &ctx, Slice ns_key, JsonMetadata *me
   auto s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;
 
+
+  // 构造 meta ，设置 json format ，然后序列化到变量 val 上
   auto format = storage_->GetConfig()->json_storage_format;
   metadata->format = format;
-
   std::string val;
   metadata->Encode(&val);
 
+  // 根据 json format 对 json_val 进行序列化，序列化后数据会追加到 val 上
   Status redis_status;
   if (format == JsonStorageFormat::JSON) {
     redis_status = json_val.Dump(&val, storage_->GetConfig()->json_max_nesting_depth);
@@ -49,9 +51,11 @@ rocksdb::Status Json::write(engine::Context &ctx, Slice ns_key, JsonMetadata *me
     return rocksdb::Status::InvalidArgument("JSON storage format not supported");
   }
   if (!redis_status) {
+    // 序列化失败，报错
     return rocksdb::Status::InvalidArgument("Failed to encode JSON into storage: " + redis_status.Msg());
   }
 
+  // 将 val 写入到 meta cf 中
   s = batch->Put(metadata_cf_handle_, ns_key, val);
   if (!s.ok()) return s;
 
@@ -60,14 +64,17 @@ rocksdb::Status Json::write(engine::Context &ctx, Slice ns_key, JsonMetadata *me
 
 rocksdb::Status Json::parse(const JsonMetadata &metadata, const Slice &json_bytes, JsonValue *value) {
   if (metadata.format == JsonStorageFormat::JSON) {
+    // 如果是普通 JSON 格式，使用 FromString 方法解析。
     auto res = JsonValue::FromString(json_bytes.ToStringView());
-    if (!res) return rocksdb::Status::Corruption(res.Msg());
-    *value = *std::move(res);
+    if (!res) return rocksdb::Status::Corruption(res.Msg()); // 如果解析失败，返回 Corruption 错误
+    *value = *std::move(res);                                     // 如果解析成功，将解析结果赋值给 value
   } else if (metadata.format == JsonStorageFormat::CBOR) {
+    // 如果是 CBOR 格式（更紧凑的二进制 JSON），用 FromCBOR 解析。
     auto res = JsonValue::FromCBOR(json_bytes.ToStringView());
     if (!res) return rocksdb::Status::Corruption(res.Msg());
     *value = *std::move(res);
   } else {
+    // 格式不支持
     return rocksdb::Status::NotSupported("JSON storage format not supported");
   }
 
@@ -75,17 +82,16 @@ rocksdb::Status Json::parse(const JsonMetadata &metadata, const Slice &json_byte
 }
 
 rocksdb::Status Json::read(engine::Context &ctx, const Slice &ns_key, JsonMetadata *metadata, JsonValue *value) {
-  std::string bytes;
-  Slice rest;
-
+  std::string bytes;  // 存储整个原始值（包括元信息部分）
+  Slice rest;         // 去除元信息之后的有效 JSON 部分
+  // [重要] 读取 ns_key 的 meta 原始数据存入 bytes 中，其包含 meta + json_data 两部分，解析出 meta 部分存入对象 metadata 中，剩余部分存入 rest 中；
   auto s = GetMetadata(ctx, {kRedisJson}, ns_key, &bytes, metadata, &rest);
   if (!s.ok()) return s;
-
+  // 根据 metadata.format 将 rest 解析 json value 对象并返回
   return parse(*metadata, rest, value);
 }
 
-rocksdb::Status Json::create(engine::Context &ctx, const std::string &ns_key, JsonMetadata &metadata,
-                             const std::string &value) {
+rocksdb::Status Json::create(engine::Context &ctx, const std::string &ns_key, JsonMetadata &metadata, const std::string &value) {
   auto json_res = JsonValue::FromString(value, storage_->GetConfig()->json_max_nesting_depth);
   if (!json_res) return rocksdb::Status::InvalidArgument(json_res.Msg());
   auto json_val = *std::move(json_res);
@@ -120,36 +126,45 @@ rocksdb::Status Json::Info(engine::Context &ctx, const std::string &user_key, Js
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status Json::Set(engine::Context &ctx, const std::string &user_key, const std::string &path,
+rocksdb::Status Json::Set(engine::Context &ctx,
+                          const std::string &user_key,
+                          const std::string &path,
                           const std::string &value) {
+
   auto ns_key = AppendNamespacePrefix(user_key);
 
+  // 读取 json format 和 json value
   JsonMetadata metadata;
   JsonValue origin;
   auto s = read(ctx, ns_key, &metadata, &origin);
 
+  // 如果 ns_key 不存在
   if (s.IsNotFound()) {
+    // 如果不是根路径（$），意味着往一个不存在的路径写入 value ，报错；
     if (path != "$") return rocksdb::Status::InvalidArgument("new objects must be created at the root");
-
+    // 如果是根路径，调用 create 方法
     return create(ctx, ns_key, metadata, value);
   }
-
+  // 其它错误，直接返回
   if (!s.ok()) return s;
 
+  // 把 value 字符串解析为 JsonValue
   auto new_res = JsonValue::FromString(value, storage_->GetConfig()->json_max_nesting_depth);
   if (!new_res) return rocksdb::Status::InvalidArgument(new_res.Msg());
   auto new_val = *std::move(new_res);
 
+  // 把 JsonValue 插入 origin 的 path 位置上
   auto set_res = origin.Set(path, std::move(new_val));
   if (!set_res) return rocksdb::Status::InvalidArgument(set_res.Msg());
 
+  // 把完成 Set 后的 JsonValue 保存到 rocksdb 上
   return write(ctx, ns_key, &metadata, origin);
 }
 
-rocksdb::Status Json::Get(engine::Context &ctx, const std::string &user_key, const std::vector<std::string> &paths,
-                          JsonValue *result) {
+rocksdb::Status Json::Get(engine::Context &ctx, const std::string &user_key, const std::vector<std::string> &paths, JsonValue *result) {
   auto ns_key = AppendNamespacePrefix(user_key);
 
+  // 读取 json format/value
   JsonMetadata metadata;
   JsonValue json_val;
   auto s = read(ctx, ns_key, &metadata, &json_val);
@@ -157,13 +172,17 @@ rocksdb::Status Json::Get(engine::Context &ctx, const std::string &user_key, con
 
   JsonValue res;
 
+
   if (paths.empty()) {
+    // 空：返回整个 JSON
     res = std::move(json_val);
   } else if (paths.size() == 1) {
+    // 一个路径：直接获取该路径的值
     auto get_res = json_val.Get(paths[0]);
     if (!get_res) return rocksdb::Status::InvalidArgument(get_res.Msg());
     res = *std::move(get_res);
   } else {
+    // 多个路径：遍历获取+合并
     for (const auto &path : paths) {
       auto get_res = json_val.Get(path);
       if (!get_res) return rocksdb::Status::InvalidArgument(get_res.Msg());
@@ -175,10 +194,15 @@ rocksdb::Status Json::Get(engine::Context &ctx, const std::string &user_key, con
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status Json::ArrAppend(engine::Context &ctx, const std::string &user_key, const std::string &path,
-                                const std::vector<std::string> &values, Optionals<size_t> *results) {
+rocksdb::Status Json::ArrAppend(engine::Context &ctx,
+                                const std::string &user_key,
+                                const std::string &path,
+                                const std::vector<std::string> &values,
+                                Optionals<size_t> *results) {
+
   auto ns_key = AppendNamespacePrefix(user_key);
 
+  // 把 values 从 strings 转换为 JsonValues
   std::vector<jsoncons::json> append_values;
   append_values.reserve(values.size());
   for (auto &v : values) {
@@ -188,24 +212,32 @@ rocksdb::Status Json::ArrAppend(engine::Context &ctx, const std::string &user_ke
     append_values.emplace_back(std::move(value.value));
   }
 
+  // 读取 ns_key 的 JsonValue
   JsonMetadata metadata;
   JsonValue value;
   auto s = read(ctx, ns_key, &metadata, &value);
   if (!s.ok()) return s;
 
+  // 向 path 指向的数组中追加元素
   auto append_res = value.ArrAppend(path, append_values);
   if (!append_res) return rocksdb::Status::InvalidArgument(append_res.Msg());
   *results = std::move(*append_res);
 
-  bool is_write =
-      std::any_of(results->begin(), results->end(), [](std::optional<uint64_t> c) { return c.has_value(); });
+  // 遍历 results 里的每个元素，任意一个元素的 c.has_value() 返回 true ，is_write 就是 true ，意味着需要更新存储
+  bool is_write = std::any_of(results->begin(), results->end(), [](std::optional<uint64_t> c) { return c.has_value(); });
   if (!is_write) return rocksdb::Status::OK();
 
   return write(ctx, ns_key, &metadata, value);
 }
 
-rocksdb::Status Json::ArrIndex(engine::Context &ctx, const std::string &user_key, const std::string &path,
-                               const std::string &needle, ssize_t start, ssize_t end, Optionals<ssize_t> *results) {
+rocksdb::Status Json::ArrIndex(engine::Context &ctx,
+                               const std::string &user_key,
+                               const std::string &path,
+                               const std::string &needle,
+                               ssize_t start,
+                               ssize_t end,
+                               Optionals<ssize_t> *results) {
+
   auto ns_key = AppendNamespacePrefix(user_key);
 
   auto needle_res = JsonValue::FromString(needle, storage_->GetConfig()->json_max_nesting_depth);
@@ -224,7 +256,9 @@ rocksdb::Status Json::ArrIndex(engine::Context &ctx, const std::string &user_key
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status Json::Type(engine::Context &ctx, const std::string &user_key, const std::string &path,
+rocksdb::Status Json::Type(engine::Context &ctx,
+                           const std::string &user_key,
+                           const std::string &path,
                            std::vector<std::string> *results) {
   auto ns_key = AppendNamespacePrefix(user_key);
 
@@ -240,8 +274,11 @@ rocksdb::Status Json::Type(engine::Context &ctx, const std::string &user_key, co
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status Json::Merge(engine::Context &ctx, const std::string &user_key, const std::string &path,
-                            const std::string &merge_value, bool &result) {
+rocksdb::Status Json::Merge(engine::Context &ctx,
+                            const std::string &user_key,
+                            const std::string &path,
+                            const std::string &merge_value,
+                            bool &result) {
   auto ns_key = AppendNamespacePrefix(user_key);
 
   JsonMetadata metadata;
@@ -269,7 +306,9 @@ rocksdb::Status Json::Merge(engine::Context &ctx, const std::string &user_key, c
   return write(ctx, ns_key, &metadata, json_val);
 }
 
-rocksdb::Status Json::Clear(engine::Context &ctx, const std::string &user_key, const std::string &path,
+rocksdb::Status Json::Clear(engine::Context &ctx,
+                            const std::string &user_key,
+                            const std::string &path,
                             size_t *result) {
   auto ns_key = AppendNamespacePrefix(user_key);
 
@@ -290,7 +329,9 @@ rocksdb::Status Json::Clear(engine::Context &ctx, const std::string &user_key, c
   return write(ctx, ns_key, &metadata, json_val);
 }
 
-rocksdb::Status Json::ArrLen(engine::Context &ctx, const std::string &user_key, const std::string &path,
+rocksdb::Status Json::ArrLen(engine::Context &ctx,
+                             const std::string &user_key,
+                             const std::string &path,
                              Optionals<uint64_t> *results) {
   auto ns_key = AppendNamespacePrefix(user_key);
   JsonMetadata metadata;
@@ -305,8 +346,11 @@ rocksdb::Status Json::ArrLen(engine::Context &ctx, const std::string &user_key, 
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status Json::ArrInsert(engine::Context &ctx, const std::string &user_key, const std::string &path,
-                                const int64_t &index, const std::vector<std::string> &values,
+rocksdb::Status Json::ArrInsert(engine::Context &ctx,
+                                const std::string &user_key,
+                                const std::string &path,
+                                const int64_t &index,
+                                const std::vector<std::string> &values,
                                 Optionals<uint64_t> *results) {
   auto ns_key = AppendNamespacePrefix(user_key);
 
@@ -335,7 +379,9 @@ rocksdb::Status Json::ArrInsert(engine::Context &ctx, const std::string &user_ke
   return write(ctx, ns_key, &metadata, value);
 }
 
-rocksdb::Status Json::Toggle(engine::Context &ctx, const std::string &user_key, const std::string &path,
+rocksdb::Status Json::Toggle(engine::Context &ctx,
+                             const std::string &user_key,
+                             const std::string &path,
                              Optionals<bool> *results) {
   auto ns_key = AppendNamespacePrefix(user_key);
 
@@ -351,7 +397,10 @@ rocksdb::Status Json::Toggle(engine::Context &ctx, const std::string &user_key, 
   return write(ctx, ns_key, &metadata, origin);
 }
 
-rocksdb::Status Json::ArrPop(engine::Context &ctx, const std::string &user_key, const std::string &path, int64_t index,
+rocksdb::Status Json::ArrPop(engine::Context &ctx,
+                             const std::string &user_key,
+                             const std::string &path,
+                             int64_t index,
                              std::vector<std::optional<JsonValue>> *results) {
   auto ns_key = AppendNamespacePrefix(user_key);
 
@@ -364,14 +413,15 @@ rocksdb::Status Json::ArrPop(engine::Context &ctx, const std::string &user_key, 
   if (!pop_res) return rocksdb::Status::InvalidArgument(pop_res.Msg());
   *results = *pop_res;
 
-  bool is_write = std::any_of(pop_res->begin(), pop_res->end(),
-                              [](const std::optional<JsonValue> &val) { return val.has_value(); });
+  bool is_write = std::any_of(pop_res->begin(), pop_res->end(),[](const std::optional<JsonValue> &val) { return val.has_value(); });
   if (!is_write) return rocksdb::Status::OK();
 
   return write(ctx, ns_key, &metadata, json_val);
 }
 
-rocksdb::Status Json::ObjKeys(engine::Context &ctx, const std::string &user_key, const std::string &path,
+rocksdb::Status Json::ObjKeys(engine::Context &ctx,
+                              const std::string &user_key,
+                              const std::string &path,
                               Optionals<std::vector<std::string>> *keys) {
   auto ns_key = AppendNamespacePrefix(user_key);
   JsonMetadata metadata;
@@ -385,8 +435,12 @@ rocksdb::Status Json::ObjKeys(engine::Context &ctx, const std::string &user_key,
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status Json::ArrTrim(engine::Context &ctx, const std::string &user_key, const std::string &path, int64_t start,
-                              int64_t stop, Optionals<uint64_t> *results) {
+rocksdb::Status Json::ArrTrim(engine::Context &ctx,
+                              const std::string &user_key,
+                              const std::string &path,
+                              int64_t start,
+                              int64_t stop,
+                              Optionals<uint64_t> *results) {
   auto ns_key = AppendNamespacePrefix(user_key);
 
   JsonMetadata metadata;
@@ -433,18 +487,20 @@ rocksdb::Status Json::Del(engine::Context &ctx, const std::string &user_key, con
   return write(ctx, ns_key, &metadata, json_val);
 }
 
-rocksdb::Status Json::NumIncrBy(engine::Context &ctx, const std::string &user_key, const std::string &path,
-                                const std::string &value, JsonValue *result) {
+rocksdb::Status Json::NumIncrBy(engine::Context &ctx, const std::string &user_key, const std::string &path, const std::string &value, JsonValue *result) {
   return numop(ctx, JsonValue::NumOpEnum::Incr, user_key, path, value, result);
 }
 
-rocksdb::Status Json::NumMultBy(engine::Context &ctx, const std::string &user_key, const std::string &path,
-                                const std::string &value, JsonValue *result) {
+rocksdb::Status Json::NumMultBy(engine::Context &ctx, const std::string &user_key, const std::string &path, const std::string &value, JsonValue *result) {
   return numop(ctx, JsonValue::NumOpEnum::Mul, user_key, path, value, result);
 }
 
-rocksdb::Status Json::numop(engine::Context &ctx, JsonValue::NumOpEnum op, const std::string &user_key,
-                            const std::string &path, const std::string &value, JsonValue *result) {
+rocksdb::Status Json::numop(engine::Context &ctx,
+                            JsonValue::NumOpEnum op,
+                            const std::string &user_key,
+                            const std::string &path,
+                            const std::string &value,
+                            JsonValue *result) {
   auto number_res = JsonValue::FromString(value);
   if (!number_res || !number_res.GetValue().value.is_number() || number_res.GetValue().value.is_string()) {
     return rocksdb::Status::InvalidArgument("the input value should be a number");
@@ -464,8 +520,11 @@ rocksdb::Status Json::numop(engine::Context &ctx, JsonValue::NumOpEnum op, const
   return write(ctx, ns_key, &metadata, json_val);
 }
 
-rocksdb::Status Json::StrAppend(engine::Context &ctx, const std::string &user_key, const std::string &path,
-                                const std::string &value, Optionals<uint64_t> *results) {
+rocksdb::Status Json::StrAppend(engine::Context &ctx,
+                                const std::string &user_key,
+                                const std::string &path,
+                                const std::string &value,
+                                Optionals<uint64_t> *results) {
   auto ns_key = AppendNamespacePrefix(user_key);
   JsonMetadata metadata;
   JsonValue json_val;
@@ -485,8 +544,7 @@ rocksdb::Status Json::StrAppend(engine::Context &ctx, const std::string &user_ke
   return write(ctx, ns_key, &metadata, json_val);
 }
 
-rocksdb::Status Json::StrLen(engine::Context &ctx, const std::string &user_key, const std::string &path,
-                             Optionals<uint64_t> *results) {
+rocksdb::Status Json::StrLen(engine::Context &ctx, const std::string &user_key, const std::string &path, Optionals<uint64_t> *results) {
   auto ns_key = AppendNamespacePrefix(user_key);
   JsonMetadata metadata;
   JsonValue json_val;
@@ -499,8 +557,7 @@ rocksdb::Status Json::StrLen(engine::Context &ctx, const std::string &user_key, 
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status Json::ObjLen(engine::Context &ctx, const std::string &user_key, const std::string &path,
-                             Optionals<uint64_t> *results) {
+rocksdb::Status Json::ObjLen(engine::Context &ctx, const std::string &user_key, const std::string &path, Optionals<uint64_t> *results) {
   auto ns_key = AppendNamespacePrefix(user_key);
   JsonMetadata metadata;
   JsonValue json_val;
@@ -513,8 +570,7 @@ rocksdb::Status Json::ObjLen(engine::Context &ctx, const std::string &user_key, 
   return rocksdb::Status::OK();
 }
 
-std::vector<rocksdb::Status> Json::MGet(engine::Context &ctx, const std::vector<std::string> &user_keys,
-                                        const std::string &path, std::vector<JsonValue> &results) {
+std::vector<rocksdb::Status> Json::MGet(engine::Context &ctx, const std::vector<std::string> &user_keys, const std::string &path, std::vector<JsonValue> &results) {
   std::vector<Slice> ns_keys;
   std::vector<std::string> ns_keys_string;
   ns_keys.resize(user_keys.size());
@@ -545,8 +601,10 @@ std::vector<rocksdb::Status> Json::MGet(engine::Context &ctx, const std::vector<
   return statuses;
 }
 
-rocksdb::Status Json::MSet(engine::Context &ctx, const std::vector<std::string> &user_keys,
-                           const std::vector<std::string> &paths, const std::vector<std::string> &values) {
+rocksdb::Status Json::MSet(engine::Context &ctx,
+                           const std::vector<std::string> &user_keys,
+                           const std::vector<std::string> &paths,
+                           const std::vector<std::string> &values) {
   std::vector<std::string> ns_keys;
   ns_keys.reserve(user_keys.size());
   for (const auto &user_key : user_keys) {
@@ -618,8 +676,7 @@ rocksdb::Status Json::MSet(engine::Context &ctx, const std::vector<std::string> 
   return storage_->Write(ctx, storage_->DefaultWriteOptions(), batch->GetWriteBatch());
 }
 
-std::vector<rocksdb::Status> Json::readMulti(engine::Context &ctx, const std::vector<Slice> &ns_keys,
-                                             std::vector<JsonValue> &values) {
+std::vector<rocksdb::Status> Json::readMulti(engine::Context &ctx, const std::vector<Slice> &ns_keys, std::vector<JsonValue> &values) {
   rocksdb::ReadOptions read_options = ctx.DefaultMultiGetOptions();
 
   std::vector<rocksdb::Status> statuses(ns_keys.size());
@@ -639,7 +696,9 @@ std::vector<rocksdb::Status> Json::readMulti(engine::Context &ctx, const std::ve
   return statuses;
 }
 
-rocksdb::Status Json::DebugMemory(engine::Context &ctx, const std::string &user_key, const std::string &path,
+rocksdb::Status Json::DebugMemory(engine::Context &ctx,
+                                  const std::string &user_key,
+                                  const std::string &path,
                                   std::vector<size_t> *results) {
   auto ns_key = AppendNamespacePrefix(user_key);
   JsonMetadata metadata;
@@ -660,8 +719,7 @@ rocksdb::Status Json::DebugMemory(engine::Context &ctx, const std::string &user_
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status Json::Resp(engine::Context &ctx, const std::string &user_key, const std::string &path,
-                           std::vector<std::string> *results, RESP resp) {
+rocksdb::Status Json::Resp(engine::Context &ctx, const std::string &user_key, const std::string &path, std::vector<std::string> *results, RESP resp) {
   auto ns_key = AppendNamespacePrefix(user_key);
   JsonMetadata metadata;
   JsonValue json_val;

@@ -91,8 +91,11 @@ inline uint64_t DecodeFixed64(const char *ptr) { return DecodeFixed<uint64_t>(pt
 
 template <typename T>
 bool GetFixed(rocksdb::Slice *input, T *value) {
+  // 检查是否还有足够的字节可以读取
   if (input->size() < sizeof(T)) return false;
+  // 从当前位置解析出 T 类型的值
   *value = DecodeFixed<T>(input->data());
+  // 移动游标
   input->remove_prefix(sizeof(T));
   return true;
 }

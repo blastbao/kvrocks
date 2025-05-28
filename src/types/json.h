@@ -254,16 +254,22 @@ struct JsonValue {
     }
   }
 
+  // 向数组追加元素
   StatusOr<Optionals<size_t>> ArrAppend(std::string_view path, const std::vector<jsoncons::json> &append_values) {
     Optionals<size_t> results;
 
     try {
+      // 根据 path (可能是通配符) 可以从 value 中匹配到多个 Json Node ，对每个 Node 执行 callback 回调。
       jsoncons::jsonpath::json_replace(
-          value, path, [&append_values, &results](const std::string & /*path*/, jsoncons::json &val) {
+          value,
+          path,
+          [&append_values, &results](const std::string & /*path*/, jsoncons::json &val) {
             if (val.is_array()) {
+              // 如果 val 是数组，将 append_values 追加到末尾，保存追加后的长度。
               val.insert(val.array_range().end(), append_values.begin(), append_values.end());
               results.emplace_back(val.size());
             } else {
+              // 如果不是数组，放入 nullopt ，表示该路径不能追加。
               results.emplace_back(std::nullopt);
             }
           });
@@ -271,6 +277,7 @@ struct JsonValue {
       return {Status::NotOK, e.what()};
     }
 
+    // 在 results 中保存每个匹配路径的追加结果（追加后数组大小或空值）
     return results;
   }
 
@@ -528,22 +535,24 @@ struct JsonValue {
     Optionals<JsonValue> popped_values;
 
     try {
-      jsoncons::jsonpath::json_replace(value, path,
-                                       [&popped_values, index](const std::string & /*path*/, jsoncons::json &val) {
-                                         if (val.is_array() && !val.empty()) {
-                                           auto len = static_cast<int64_t>(val.size());
-                                           auto popped_iter = val.array_range().begin();
-                                           if (index < 0) {
-                                             popped_iter += len - std::min(len, -index);
-                                           } else if (index > 0) {
-                                             popped_iter += std::min(len - 1, index);
-                                           }
-                                           popped_values.emplace_back(*popped_iter);
-                                           val.erase(popped_iter);
-                                         } else {
-                                           popped_values.emplace_back(std::nullopt);
-                                         }
-                                       });
+      jsoncons::jsonpath::json_replace(
+          value,
+          path,
+          [&popped_values, index](const std::string & /*path*/, jsoncons::json &val) {
+            if (val.is_array() && !val.empty()) {
+              auto len = static_cast<int64_t>(val.size());
+              auto popped_iter = val.array_range().begin();
+              if (index < 0) {
+                popped_iter += len - std::min(len, -index);
+              } else if (index > 0) {
+                popped_iter += std::min(len - 1, index);
+              }
+              popped_values.emplace_back(*popped_iter);
+              val.erase(popped_iter);
+            } else {
+              popped_values.emplace_back(std::nullopt);
+            }
+          });
     } catch (const jsoncons::jsonpath::jsonpath_error &e) {
       return {Status::NotOK, e.what()};
     }
@@ -596,36 +605,52 @@ struct JsonValue {
   Status NumOp(std::string_view path, const JsonValue &number, NumOpEnum op, JsonValue *result) {
     Status status = Status::OK();
     try {
-      jsoncons::jsonpath::json_replace(value, path, [&](const std::string & /*path*/, jsoncons::json &origin) {
-        if (!status.IsOK()) {
-          return;
-        }
-        // is_number() will return true
-        // if it's actually a string but can convert to a number
-        // so here we should exclude such case
-        if (!origin.is_number() || origin.is_string()) {
-          result->value.push_back(jsoncons::json::null());
-          return;
-        }
-        double v = 0;
-        if (op == NumOpEnum::Incr) {
-          v = origin.as_double() + number.value.as_double();
-        } else if (op == NumOpEnum::Mul) {
-          v = origin.as_double() * number.value.as_double();
-        }
-        if (std::isinf(v)) {
-          status = {Status::RedisExecErr, "the result is an infinite number"};
-          return;
-        }
-        double v_int = 0;
-        if (std::modf(v, &v_int) == 0 && double(std::numeric_limits<int64_t>::min()) < v &&
-            v < double(std::numeric_limits<int64_t>::max())) {
-          origin = int64_t(v);
-        } else {
-          origin = v;
-        }
-        result->value.push_back(origin);
-      });
+      jsoncons::jsonpath::json_replace(
+        value,
+          path,
+          [&](const std::string & /*path*/, jsoncons::json &origin) {
+            // 如果解析过程出现错误，跳过后续操作
+            if (!status.IsOK()) {
+              return;
+            }
+
+            // is_number() will return true
+            // if it's actually a string but can convert to a number
+            // so here we should exclude such case
+            //
+            // 判断 origin 是否是数值，如果不是有效数字，则向 result 中加入 null，表示操作无效。
+            if (!origin.is_number() || origin.is_string()) {
+              result->value.push_back(jsoncons::json::null());
+              return;
+            }
+
+            // 根据操作类型，加法或乘法，计算结果。
+            double v = 0;
+            if (op == NumOpEnum::Incr) {
+              v = origin.as_double() + number.value.as_double();
+            } else if (op == NumOpEnum::Mul) {
+              v = origin.as_double() * number.value.as_double();
+            }
+
+            // 溢出报错
+            if (std::isinf(v)) {
+              status = {Status::RedisExecErr, "the result is an infinite number"};
+              return;
+            }
+
+            // 判断结果 v 是否是整数且在 64 位整数范围内，如果是，保存为整型；否则保存为浮点型。
+            //
+            // 备注：double 能表示的整数范围远远超出 int64 ，但是其精度有限，只能精确到 ±2^53。
+            double v_int = 0;
+            if (std::modf(v, &v_int) == 0 && double(std::numeric_limits<int64_t>::min()) < v && v < double(std::numeric_limits<int64_t>::max())) {
+              origin = int64_t(v);
+            } else {
+              origin = v;
+            }
+
+            // 保存结果
+            result->value.push_back(origin);
+          });
     } catch (const jsoncons::jsonpath::jsonpath_error &e) {
       return {Status::NotOK, e.what()};
     }

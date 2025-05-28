@@ -30,6 +30,12 @@
 
 namespace redis {
 
+
+// Kvrocks 目前基于 RocksDB + jsoncons（或类似库）实现 JSON 解析和修改，流程大致是：
+//  - 从 RocksDB 读取二进制 JSON 字符串
+//  - 反序列化成内存中的 JSON 树结构（JsonValue）
+//  - 修改操作（增删改）
+//  - 序列化回字符串写入 RocksDB
 class Json : public Database {
  public:
   Json(engine::Storage *storage, std::string ns) : Database(storage, std::move(ns)) {}

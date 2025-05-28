@@ -48,13 +48,19 @@ Database::Database(engine::Storage *storage, std::string ns)
       namespace_(std::move(ns)) {}
 
 
-// 从 bytes 中解析 Metadata（TTL、类型、size等），并进行类型匹配、过期检查、空元素检查等验证，如果不合法或不匹配，就返回对应的 Status。
+// 过程：
+//  - 解码元信息：尝试从 bytes 中解析出 metadata。
+//  - 过期检查：如果 key 已过期，返回 NotFound。
+//  - 类型检查：判断当前 metadata 类型是否符合当前操作的预期。
+//  - 元素检查：如果结构不允许空元素，但实际 size 为 0，返回 NotFound。
+//  - 错误处理：对无效参数、类型不匹配等返回合理的 Status。
+//  - 回滚机制：发生错误时，通过回退 metadata 的状态来避免后续操作出错。
 rocksdb::Status Database::ParseMetadata(RedisTypes types, Slice *bytes, Metadata *metadata) {
   // 备份当前 metadata ，为后续报错时回滚使用
   std::string old_metadata;
   metadata->Encode(&old_metadata);
 
-  // 把 bytes 解码为 metadata
+  // 把 bytes 解码为 metadata ，已经解析的字节会从 bytes 中移除(通过游标实现)，剩余字节被保留
   auto s = metadata->Decode(bytes);
   // delay InvalidArgument error check after type match check
   // 出错返回
@@ -78,7 +84,7 @@ rocksdb::Status Database::ParseMetadata(RedisTypes types, Slice *bytes, Metadata
   // 参数错误
   if (s.IsInvalidArgument()) return s;
 
-  // 空数据检查
+  // 空数据检查：有些数据结构类型不允许为空，如果其元素数为 0 则非法
   if (metadata->size == 0 && !metadata->IsEmptyableType()) {
     // error discarded here since it already failed
     auto _ [[maybe_unused]] = metadata->Decode(old_metadata); // 回滚
@@ -108,12 +114,10 @@ rocksdb::Status Database::GetMetadata(engine::Context &ctx,
                                       Metadata *metadata,
                                       Slice *rest) {
 
-  // 根据 ns_key 去 meta_cf 读取 meta
   auto s = GetRawMetadata(ctx, ns_key, raw_value);
   *rest = *raw_value;
   if (!s.ok()) return s;
 
-  // 解析 meta
   return ParseMetadataWithStats(types, rest, metadata);
 }
 
