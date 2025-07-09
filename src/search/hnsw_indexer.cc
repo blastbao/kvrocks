@@ -39,8 +39,7 @@ HnswNode::HnswNode(NodeKey key, uint16_t level) : key(std::move(key)), level(lev
 StatusOr<HnswNodeFieldMetadata> HnswNode::DecodeMetadata(engine::Context& ctx, const SearchKey& search_key) const {
   auto node_index_key = search_key.ConstructHnswNode(level, key);
   rocksdb::PinnableSlice value;
-  auto s = ctx.storage->Get(ctx, ctx.GetReadOptions(), ctx.storage->GetCFHandle(ColumnFamilyID::Search), node_index_key,
-                            &value);
+  auto s = ctx.storage->Get(ctx, ctx.GetReadOptions(), ctx.storage->GetCFHandle(ColumnFamilyID::Search), node_index_key, &value);
   if (!s.ok()) return {Status::NotOK, s.ToString()};
 
   HnswNodeFieldMetadata metadata;
@@ -49,12 +48,10 @@ StatusOr<HnswNodeFieldMetadata> HnswNode::DecodeMetadata(engine::Context& ctx, c
   return metadata;
 }
 
-Status HnswNode::PutMetadata(HnswNodeFieldMetadata* node_meta, const SearchKey& search_key, engine::Storage* storage,
-                             rocksdb::WriteBatchBase* batch) const {
+Status HnswNode::PutMetadata(HnswNodeFieldMetadata* node_meta, const SearchKey& search_key, engine::Storage* storage, rocksdb::WriteBatchBase* batch) const {
   std::string updated_metadata;
   node_meta->Encode(&updated_metadata);
-  auto s = batch->Put(storage->GetCFHandle(ColumnFamilyID::Search), search_key.ConstructHnswNode(level, key),
-                      updated_metadata);
+  auto s = batch->Put(storage->GetCFHandle(ColumnFamilyID::Search), search_key.ConstructHnswNode(level, key),updated_metadata);
   if (!s.ok()) {
     return {Status::NotOK, s.ToString()};
   }

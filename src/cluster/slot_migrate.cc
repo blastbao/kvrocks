@@ -252,7 +252,7 @@ void SlotMigrator::runMigrationProcess() {
         }
         break;
       }
-      case SlotMigrationStage::kSuccess: {  // 迁移成功，发送 cluster import 命令通知目标节点导入完成，并更新当前节点的 migrated_slots_ 映射记录每个被迁移 slot 新节点的 ip:port
+      case SlotMigrationStage::kSuccess: {  // 迁移成功，发送 cluster import success 命令通知目标节点导入完成，并更新当前节点的 migrated_slots_ 映射记录每个被迁移 slot 新节点的 ip:port
         auto s = finishSuccessfulMigration();
         if (s.IsOK()) {
           info("[migrate] Succeed to migrate slot(s) {}", slot_range_.load().String());
@@ -507,6 +507,8 @@ Status SlotMigrator::finishSuccessfulMigration() {
   std::string dst_ip_port = dst_ip_ + ":" + std::to_string(dst_port_);
 
   // 更新 slot_range_ 内每个 slot 的新归属节点
+  //
+  // 重要，至此 slot 迁移成功，所有请求本 node 的 slot 请求会被重定向到新节点，以确保数据一致性。
   s = srv_->cluster->SetSlotRangeMigrated(slot_range_, dst_ip_port);
   if (!s.IsOK()) {
     return s.Prefixed(
@@ -1370,7 +1372,8 @@ Status SlotMigrator::syncWalAfterForbiddingSlot() {
 
 void SlotMigrator::GetMigrationInfo(std::string *info) const {
   info->clear();
-  if (!slot_range_.load().IsValid() && !forbidden_slot_range_.load().IsValid() &&
+  if (!slot_range_.load().IsValid() &&
+      !forbidden_slot_range_.load().IsValid() &&
       !migrate_failed_slot_range_.load().IsValid()) {
     return;
   }

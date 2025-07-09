@@ -37,8 +37,8 @@ inline constexpr auto kErrorIncorrectLength = "length is too short or too long t
 
 class IndexMetadata {
  public:
-  uint8_t flag = 0;  // all reserved
-  IndexOnDataType on_data_type;
+  uint8_t flag = 0;                 // 标记位，当前未使用 // all reserved
+  IndexOnDataType on_data_type;     // 数据类型
 
   const std::string &OnDataTypeName() const { return RedisTypeNames[(size_t)on_data_type]; }
 
@@ -61,26 +61,26 @@ class IndexMetadata {
 };
 
 enum class SearchSubkeyType : uint8_t {
-  INDEX_META = 0,
+  INDEX_META = 0, // 索引元信息
 
   PREFIXES = 1,
 
   // field metadata
-  FIELD_META = 2,
+  FIELD_META = 2, // 字段元信息
 
   // field indexing data
-  FIELD = 3,
+  FIELD = 3,  // 字段索引数据
 
   // field alias
   FIELD_ALIAS = 4,
 };
 
 enum class IndexFieldType : uint8_t {
-  TAG = 1,
+  TAG = 1,      // 0b0001
 
-  NUMERIC = 2,
+  NUMERIC = 2,  // 0b0010
 
-  VECTOR = 3,
+  VECTOR = 3,   // 0b0011
 };
 
 enum class VectorType : uint8_t {
@@ -121,9 +121,9 @@ enum class HnswLevelType : uint8_t {
 };
 
 struct SearchKey {
-  std::string_view ns;
-  std::string_view index;
-  std::string_view field;
+  std::string_view ns;      // 命名空间
+  std::string_view index;   // 索引名
+  std::string_view field;   // 字段名
 
   SearchKey(std::string_view ns, std::string_view index) : ns(ns), index(index) {}
   SearchKey(std::string_view ns, std::string_view index, std::string_view field) : ns(ns), index(index), field(field) {}
@@ -139,6 +139,11 @@ struct SearchKey {
 
   static void PutHnswLevelType(std::string *dst, HnswLevelType type) { PutFixed8(dst, uint8_t(type)); }
 
+  // <namespace_len><namespace>
+  // <type: SearchSubkeyType>
+  // <index_len><index>
+  // <field_len><field>
+  // <level>
   void PutHnswLevelPrefix(std::string *dst, uint16_t level) const {
     PutNamespace(dst);
     PutType(dst, SearchSubkeyType::FIELD);
@@ -157,6 +162,9 @@ struct SearchKey {
     PutHnswLevelType(dst, HnswLevelType::EDGE);
   }
 
+
+
+  // 构造索引元数据：ns + type(INDEX_META) + index
   std::string ConstructIndexMeta() const {
     std::string dst;
     PutNamespace(&dst);
@@ -165,6 +173,7 @@ struct SearchKey {
     return dst;
   }
 
+  // 构造索引前缀：ns + type(PREFIXES) + index
   std::string ConstructIndexPrefixes() const {
     std::string dst;
     PutNamespace(&dst);
@@ -173,6 +182,7 @@ struct SearchKey {
     return dst;
   }
 
+  // 构造某个字段的元信息：ns + type(FIELD_META) + index
   std::string ConstructFieldMeta() const {
     std::string dst;
     PutNamespace(&dst);
@@ -218,6 +228,7 @@ struct SearchKey {
     return dst;
   }
 
+  // ns + type + index + field + tag(string) + key
   std::string ConstructTagFieldData(std::string_view tag, std::string_view key) const {
     std::string dst;
     PutNamespace(&dst);
@@ -229,6 +240,7 @@ struct SearchKey {
     return dst;
   }
 
+  // ns + type + index + field + num(double) + key
   std::string ConstructNumericFieldData(double num, std::string_view key) const {
     std::string dst;
     PutNamespace(&dst);
@@ -308,12 +320,14 @@ struct IndexFieldMetadata {
 
   explicit IndexFieldMetadata(IndexFieldType type) : type(type) {}
 
+  // 构造 flag ：最低 1 位为 noindex ，次低 4 位为 type ，高 3 位保留
+  //
   // flag: <noindex: 1 bit> <type: 4 bit> <reserved: 3 bit>
   uint8_t MakeFlag() const { return noindex | (uint8_t)type << 1; }
 
   void DecodeFlag(uint8_t flag) {
-    noindex = flag & 1;
-    type = DecodeType(flag);
+    noindex = flag & 1;       // 取最低位
+    type = DecodeType(flag);  // 取次 4 位
   }
 
   static IndexFieldType DecodeType(uint8_t flag) { return IndexFieldType(flag >> 1); }
@@ -384,16 +398,16 @@ struct NumericFieldMetadata : IndexFieldMetadata {
 };
 
 struct HnswVectorFieldMetadata : IndexFieldMetadata {
-  VectorType vector_type;
-  uint16_t dim;
-  DistanceMetric distance_metric;
+  VectorType vector_type;          // 向量类型，如 float32、float64 等
+  uint16_t dim;                    // 向量维度
+  DistanceMetric distance_metric;  // 距离指标
 
-  uint32_t initial_cap = 500000;   // Initial vector capacity
-  uint16_t m = 16;                 // Max allowed outgoing edges per node
-  uint32_t ef_construction = 200;  // Max potential outgoing edge candidates during construction
-  uint32_t ef_runtime = 10;        // Max top candidates held during KNN search
-  double epsilon = 0.01;           // Relative factor setting search boundaries in range queries
-  uint16_t num_levels = 0;         // Number of levels in the HNSW graph
+  uint32_t initial_cap = 500000;   // 初始向量容量       // Initial vector capacity
+  uint16_t m = 16;                 // 最大出边数         // Max allowed outgoing edges per node
+  uint32_t ef_construction = 200;  // 最大的潜在出边数    // Max potential outgoing edge candidates during construction
+  uint32_t ef_runtime = 10;        // 候选集大小         // Max top candidates held during KNN search
+  double epsilon = 0.01;           // 相关因子           // Relative factor setting search boundaries in range queries
+  uint16_t num_levels = 0;         // 最大层数           // Number of levels in the HNSW graph
 
   HnswVectorFieldMetadata() : IndexFieldMetadata(IndexFieldType::VECTOR) {}
 
@@ -439,35 +453,45 @@ struct HnswVectorFieldMetadata : IndexFieldMetadata {
 };
 
 struct HnswNodeFieldMetadata {
-  uint16_t num_neighbours;
-  std::vector<double> vector;
+  uint16_t num_neighbours;      // 当前节点在某一层中的邻居数量。用于维护图的稀疏度，边删除时也会更新。
+  std::vector<double> vector;   // 节点向量，参与向量相似度计算。
 
   HnswNodeFieldMetadata() = default;
   HnswNodeFieldMetadata(uint16_t num_neighbours, std::vector<double> vector)
       : num_neighbours(num_neighbours), vector(std::move(vector)) {}
 
+
+  // example:
+  //  [num_neighbours:2B][dim:2B][v[0]:8B][v[1]:8B][v[2]:8B]...
   void Encode(std::string *dst) const {
+    // 写入邻居数目，2B
     PutFixed16(dst, num_neighbours);
+    // 写入向量长度，2B
     PutFixed16(dst, static_cast<uint16_t>(vector.size()));
+    // 依次写入 vector 中的元素，每个元素是个 double (8B)
     for (double element : vector) {
       PutDouble(dst, element);
     }
   }
 
   rocksdb::Status Decode(Slice *input) {
+    // 至少包含 4B
     if (input->size() < 2 + 2) {
       return rocksdb::Status::Corruption(kErrorInsufficientLength);
     }
-    GetFixed16(input, (uint16_t *)(&num_neighbours));
 
+    // 读取 num_neighbours
+    GetFixed16(input, (uint16_t *)(&num_neighbours));
+    // 读取 dim
     uint16_t dim = 0;
     GetFixed16(input, (uint16_t *)(&dim));
-
+    // 检查剩下字节数是否等于 dim * sizeof(double)
     if (input->size() != dim * sizeof(double)) {
       return rocksdb::Status::Corruption(kErrorIncorrectLength);
     }
-    vector.resize(dim);
 
+    //  逐个读取 double 值填入 vector 数组
+    vector.resize(dim);
     for (auto i = 0; i < dim; ++i) {
       GetDouble(input, &vector[i]);
     }
@@ -476,10 +500,12 @@ struct HnswNodeFieldMetadata {
 };
 
 inline rocksdb::Status IndexFieldMetadata::Decode(Slice *input, std::unique_ptr<IndexFieldMetadata> &ptr) {
+  // 数据长度不足
   if (input->size() < 1) {
     return rocksdb::Status::Corruption(kErrorInsufficientLength);
   }
 
+  // 首字节为字段类型
   switch (DecodeType((*input)[0])) {
     case IndexFieldType::TAG:
       ptr = std::make_unique<TagFieldMetadata>();
@@ -494,7 +520,9 @@ inline rocksdb::Status IndexFieldMetadata::Decode(Slice *input, std::unique_ptr<
       return rocksdb::Status::Corruption("encountered unknown field type");
   }
 
+  // 调用实际类对象的 Decode() 进行解析
   return ptr->Decode(input);
+
 }
 
 }  // namespace redis
